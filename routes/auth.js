@@ -61,17 +61,15 @@ router.post('/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
     const user = await User.findOne({ email: email?.toLowerCase() });
-    // Always respond 200 — don't leak whether email exists
     if (!user) return res.json({ message: 'If that email exists, a reset link has been sent.' });
 
     const token  = crypto.randomBytes(32).toString('hex');
     user.resetToken       = token;
-    user.resetTokenExpiry = Date.now() + 1000 * 60 * 60; // 1 hour
+    user.resetTokenExpiry = Date.now() + 1000 * 60 * 60;
     await user.save();
 
     const resetUrl = `${process.env.FRONTEND_URL}/pages/auth/forgot-password.html?token=${token}`;
 
-    // Send reset email via nodemailer (configure SMTP in .env)
     if (process.env.SMTP_HOST) {
       const nodemailer = require('nodemailer');
       const transporter = nodemailer.createTransport({
@@ -87,8 +85,7 @@ router.post('/forgot-password', async (req, res) => {
         html:    `<p>Hi ${user.name},</p><p>Click the link below to reset your password (valid for 1 hour):</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>If you did not request this, ignore this email.</p>`,
       });
     } else {
-      // No SMTP configured — log for dev only
-      console.log('🔑 Password reset URL (dev only — set SMTP_HOST in .env to send real emails):', resetUrl);
+      console.log('🔑 Password reset URL (dev only):', resetUrl);
     }
 
     res.json({ message: 'If that email exists, a reset link has been sent.' });
@@ -118,7 +115,7 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
-// GET /auth/google  — redirect to Google
+// GET /auth/google
 router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 
 // GET /auth/google/callback
@@ -126,25 +123,24 @@ router.get('/google/callback',
   passport.authenticate('google', { session: false, failureRedirect: process.env.FRONTEND_URL + '/pages/auth/login.html?error=google' }),
   (req, res) => {
     const token = makeToken(req.user);
-    // Redirect to frontend OAuth callback page with token in query string
     res.redirect(`${process.env.FRONTEND_URL}/pages/oauth/oauth-callback.html?token=${token}&provider=google`);
   }
 );
 
-// GET /auth/instagram/url  — return Instagram OAuth URL for frontend to redirect
+// GET /auth/instagram/url — return Instagram OAuth URL
 router.get('/instagram/url', async (req, res) => {
   try {
     const clientId    = process.env.INSTAGRAM_CLIENT_ID;
     const redirectUri = encodeURIComponent(process.env.INSTAGRAM_REDIRECT_URI);
-    const scope       = encodeURIComponent('instagram_basic,instagram_manage_messages,pages_show_list,pages_messaging');
-    const url = `https://api.instagram.com/oauth/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&scope=${scope}&response_type=code`;
+    const scope       = encodeURIComponent('instagram_business_basic,instagram_business_manage_messages,instagram_manage_comments');
+    const url = `https://www.instagram.com/oauth/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&scope=${scope}&response_type=code`;
     res.json({ url });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /auth/instagram/callback  — exchange code for token, redirect to frontend
+// GET /auth/instagram/callback — exchange code for token
 router.get('/instagram/callback', async (req, res) => {
   try {
     const { code, error } = req.query;
@@ -154,25 +150,43 @@ router.get('/instagram/callback', async (req, res) => {
     const axios = require('axios');
 
     // Exchange code for short-lived token
-    const tokenRes = await axios.post('https://api.instagram.com/oauth/access_token', new URLSearchParams({
-      client_id:     process.env.INSTAGRAM_CLIENT_ID,
-      client_secret: process.env.INSTAGRAM_CLIENT_SECRET,
-      grant_type:    'authorization_code',
-      redirect_uri:  process.env.INSTAGRAM_REDIRECT_URI,
-      code,
-    }), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+    const tokenRes = await axios.post(
+      'https://api.instagram.com/oauth/access_token',
+      new URLSearchParams({
+        client_id:     process.env.INSTAGRAM_CLIENT_ID,
+        client_secret: process.env.INSTAGRAM_CLIENT_SECRET,
+        grant_type:    'authorization_code',
+        redirect_uri:  process.env.INSTAGRAM_REDIRECT_URI,
+        code,
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
 
     const { access_token, user_id } = tokenRes.data;
 
-    // Get username and profile picture
-    const profileRes = await axios.get(`https://graph.instagram.com/${user_id}?fields=id,username,profile_picture_url&access_token=${access_token}`);
-    const { username, profile_picture_url } = profileRes.data;
+    // Exchange for long-lived token
+    const longTokenRes = await axios.get(
+      `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${process.env.INSTAGRAM_CLIENT_SECRET}&access_token=${access_token}`
+    );
+    const long_lived_token = longTokenRes.data.access_token;
 
-    // Pass data to frontend callback page via query string
-    const igData = encodeURIComponent(JSON.stringify({ accessToken: access_token, userId: user_id, username, profilePic: profile_picture_url || '' }));
+    // Get profile info using new Business API
+    const profileRes = await axios.get(
+      `https://graph.instagram.com/v19.0/me?fields=id,username,profile_picture_url,name&access_token=${long_lived_token}`
+    );
+    const { username, profile_picture_url, name } = profileRes.data;
+
+    const igData = encodeURIComponent(JSON.stringify({
+      accessToken: long_lived_token,
+      userId:      user_id,
+      username,
+      name:        name || username,
+      profilePic:  profile_picture_url || ''
+    }));
+
     res.redirect(`${process.env.FRONTEND_URL}/pages/oauth/instagram-callback.html?igData=${igData}`);
   } catch (err) {
-    console.error('Instagram callback error:', err.message);
+    console.error('Instagram callback error:', err.response?.data || err.message);
     res.redirect(`${process.env.FRONTEND_URL}/pages/oauth/instagram-callback.html?error=failed`);
   }
 });
