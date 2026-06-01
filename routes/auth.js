@@ -132,7 +132,7 @@ router.get('/instagram/url', async (req, res) => {
   try {
     const clientId    = process.env.INSTAGRAM_CLIENT_ID;
     const redirectUri = encodeURIComponent(process.env.INSTAGRAM_REDIRECT_URI);
-    const scope       = encodeURIComponent('instagram_business_basic,instagram_business_manage_messages,instagram_manage_comments');
+    const scope       = encodeURIComponent('instagram_business_basic');
     const url = `https://www.instagram.com/oauth/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&scope=${scope}&response_type=code`;
     res.json({ url });
   } catch (err) {
