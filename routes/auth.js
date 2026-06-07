@@ -236,13 +236,11 @@ router.get('/instagram/callback', async (req, res) => {
     );
     const long_lived_token = longTokenRes.data.access_token;
 
-    // Get profile info
-    // NOTE: profile_picture_url is NOT available in instagram_business_basic scope.
-    // We only fetch id, username, name, account_type here.
+    // Get profile info including profile picture
     const profileRes = await axios.get(
-      `https://graph.instagram.com/v19.0/me?fields=id,username,name,account_type&access_token=${long_lived_token}`
+      `https://graph.instagram.com/v19.0/me?fields=id,username,name,account_type,profile_picture_url&access_token=${long_lived_token}`
     );
-    const { username, name } = profileRes.data;
+    const { username, name, profile_picture_url } = profileRes.data;
 
     // Save directly to DB using .save() so the pre-save hook encrypts the token
     const user = await User.findById(userId);
@@ -252,14 +250,14 @@ router.get('/instagram/callback', async (req, res) => {
     user.instagram.accessToken = long_lived_token;
     user.instagram.userId      = user_id;
     user.instagram.username    = username;
-    user.instagram.profilePic  = ''; // profile_picture_url not available in instagram_business_basic scope
+    user.instagram.profilePic  = profile_picture_url || '';
     await user.save(); // pre-save hook encrypts accessToken here ✅
 
     // Redirect with ONLY safe display data — no token ever reaches the browser
     const safeData = encodeURIComponent(JSON.stringify({
       username,
       name: name || username,
-      profilePic: '',
+      profilePic: profile_picture_url || '',
     }));
 
     res.redirect(`${process.env.FRONTEND_URL}/pages/oauth/instagram-callback.html?igData=${safeData}`);
