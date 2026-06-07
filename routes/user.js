@@ -7,14 +7,43 @@ const User      = require('../models/User');
 // GET /api/user/me
 router.get('/me', requireAuth, async (req, res) => {
   try {
-    // req.user already set by middleware (no password, no instagram.accessToken)
-    // Map DB field names to frontend-expected names so counters display correctly
-    const u = req.user.toObject ? req.user.toObject() : req.user;
+    const user = await require('../models/User').findById(req.user._id);
+    if (!user) return res.status(404).json({ error: 'User not found.' });
+
+    // If Instagram is connected, always re-fetch fresh profile pic from Instagram
+    // (Instagram CDN URLs expire in 24-48h, so we refresh on every /me call)
+    if (user.instagram?.connected && user.instagram?.accessToken) {
+      try {
+        const axios = require('axios');
+        const token = user.decryptIgToken();
+        const igRes = await axios.get(
+          `https://graph.instagram.com/v19.0/me?fields=profile_picture_url&access_token=${token}`
+        );
+        const freshPic = igRes.data?.profile_picture_url || '';
+        if (freshPic && freshPic !== user.instagram.profilePic) {
+          user.instagram.profilePic = freshPic;
+          await user.save();
+        }
+      } catch (igErr) {
+        // IG fetch failed — just continue with whatever is stored
+      }
+    }
+
+    const u = user.toObject();
     const safe = {
       ...u,
-      dmsSent:  u.dmsSentMonth || 0,   // frontend reads dmsSent
-      dmsLimit: u.dmLimit      || 500,  // frontend reads dmsLimit
+      dmsSent:  u.dmsSentMonth || 0,
+      dmsLimit: u.dmLimit      || 500,
+      instagram: {
+        connected:  u.instagram?.connected  || false,
+        username:   u.instagram?.username   || '',
+        profilePic: u.instagram?.profilePic || '',
+        userId:     u.instagram?.userId     || '',
+        pageId:     u.instagram?.pageId     || '',
+      },
     };
+    delete safe.password;
+    delete safe['instagram.accessToken'];
     res.json(safe);
   } catch (err) {
     res.status(500).json({ error: 'Internal server error.' });
