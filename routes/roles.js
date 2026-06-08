@@ -1,20 +1,15 @@
-// routes/roles.js
-// Public endpoint — careers page fetches active roles from here
-const express = require('express');
-const router  = express.Router();
-const Role    = require('../models/Role');
+// models/Role.js
+const mongoose = require('mongoose');
 
-// GET /api/roles — public, returns only active roles
-router.get('/', async (req, res) => {
-  try {
-    const roles = await Role.find({ active: true }).sort({ createdAt: -1 });
-    res.json(roles);
-  } catch {
-    res.status(500).json({ error: 'Failed to fetch roles.' });
-  }
-});
+const roleSchema = new mongoose.Schema({
+  title:           { type: String, required: true, trim: true },
+  stipend:         { type: String, default: 'Unpaid', trim: true },
+  duration:        { type: String, default: '', trim: true },
+  skills:          [{ type: String, trim: true }],
+  mode:            { type: String, enum: ['Remote', 'Hybrid', 'Onsite'], default: 'Remote' },
+  active:          { type: Boolean, default: true },
+  formLink:        { type: String, default: '' },
+  certTemplateImg: { type: String, default: '' },  // base64 dataURL of certificate template image
+}, { timestamps: true });
 
-// POST / PUT / PATCH / DELETE — delegate to /api/hr/roles (HR-protected)
-// These stubs exist so hr.html can POST to /api/roles directly if using old URL
-// (hr.html was updated to use /api/hr/roles but keeping fallback here)
-module.exports = router;
+module.exports = mongoose.model('Role', roleSchema);
