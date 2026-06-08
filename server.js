@@ -63,6 +63,11 @@ app.use('/api/inbox',     apiLimiter,  require('./routes/inbox'));
 app.use('/api/ig',        apiLimiter,  require('./routes/ig'));
 app.use('/api/billing',   apiLimiter,  require('./routes/billing'));
 
+// ── Careers / HR routes ────────────────────────────────────
+app.use('/api/hr',     apiLimiter, require('./routes/hr'));       // HR login + management
+app.use('/api/roles',  apiLimiter, require('./routes/roles'));    // Public: active job listings
+app.use('/api/joiner', apiLimiter, require('./routes/joiner'));   // Candidate: verify ID + submit form
+
 // ── Health check ───────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', ts: new Date() }));
 
