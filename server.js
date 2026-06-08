@@ -12,13 +12,24 @@ const app = express();
 
 // ── Security & parsing ─────────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: false }));
+
 // Allow multiple frontend origins (comma-separated in FRONTEND_URL)
-const _allowedOrigins = (process.env.FRONTEND_URL || '').split(',').map(o => o.trim()).filter(Boolean);
+// e.g. FRONTEND_URL=https://dmflowapp.in,https://dmflowapp.pages.dev
+const _allowedOrigins = (process.env.FRONTEND_URL || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
+console.log('✅  Allowed CORS origins:', _allowedOrigins.length ? _allowedOrigins : '(none set — all origins blocked)');
+
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, Postman)
+    // Allow requests with no origin (mobile apps, curl, Postman, server-to-server)
     if (!origin) return callback(null, true);
     if (_allowedOrigins.includes(origin)) return callback(null, true);
+    // In development (no FRONTEND_URL set), allow all — never in production
+    if (!process.env.FRONTEND_URL) return callback(null, true);
+    console.warn('CORS blocked origin:', origin);
     callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
