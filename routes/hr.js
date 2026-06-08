@@ -80,9 +80,9 @@ router.get('/roles', requireHrAuth, async (req, res) => {
 // POST /api/hr/roles
 router.post('/roles', requireHrAuth, async (req, res) => {
   try {
-    const { title, stipend, duration, skills, mode, active, formLink } = req.body;
+    const { title, stipend, duration, skills, mode, active, formLink, certTemplateImg } = req.body;
     if (!title) return res.status(400).json({ error: 'Job title is required.' });
-    const role = await Role.create({ title, stipend, duration, skills, mode, active, formLink });
+    const role = await Role.create({ title, stipend, duration, skills, mode, active, formLink, certTemplateImg: certTemplateImg || '' });
     res.status(201).json(role);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create role.' });
@@ -92,10 +92,12 @@ router.post('/roles', requireHrAuth, async (req, res) => {
 // PUT /api/hr/roles/:id
 router.put('/roles/:id', requireHrAuth, async (req, res) => {
   try {
-    const { title, stipend, duration, skills, mode, active, formLink } = req.body;
+    const { title, stipend, duration, skills, mode, active, formLink, certTemplateImg } = req.body;
+    const updateData = { title, stipend, duration, skills, mode, active, formLink };
+    if (certTemplateImg !== undefined) updateData.certTemplateImg = certTemplateImg;
     const role = await Role.findByIdAndUpdate(
       req.params.id,
-      { title, stipend, duration, skills, mode, active, formLink },
+      updateData,
       { new: true, runValidators: true }
     );
     if (!role) return res.status(404).json({ error: 'Role not found.' });
