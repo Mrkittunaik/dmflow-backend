@@ -1,15 +1,18 @@
-// models/Role.js
-const mongoose = require('mongoose');
+// routes/roles.js
+// Public endpoint — returns active job listings for the careers page
+const express = require('express');
+const router  = express.Router();
+const Role    = require('../models/Role');
 
-const roleSchema = new mongoose.Schema({
-  title:           { type: String, required: true, trim: true },
-  stipend:         { type: String, default: 'Unpaid', trim: true },
-  duration:        { type: String, default: '', trim: true },
-  skills:          [{ type: String, trim: true }],
-  mode:            { type: String, enum: ['Remote', 'Hybrid', 'Onsite'], default: 'Remote' },
-  active:          { type: Boolean, default: true },
-  formLink:        { type: String, default: '' },
-  certTemplateImg: { type: String, default: '' },  // base64 dataURL of certificate template image
-}, { timestamps: true });
+// GET /api/roles — public, no auth required
+router.get('/', async (req, res) => {
+  try {
+    const roles = await Role.find({ active: true }).sort({ createdAt: -1 });
+    res.json(roles);
+  } catch (err) {
+    console.error('Roles fetch error:', err);
+    res.status(500).json({ error: 'Failed to fetch roles.' });
+  }
+});
 
-module.exports = mongoose.model('Role', roleSchema);
+module.exports = router;
