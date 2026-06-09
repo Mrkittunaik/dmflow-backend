@@ -17,11 +17,11 @@ router.get('/', requireAuth, async (req, res) => {
 // POST /api/automations
 router.post('/', requireAuth, async (req, res) => {
   try {
-    const { name, type, active, trigger, actions, mediaId, keyword, keywords,
+    const { name, type, active, trigger, actions, mediaId, mediaUrl, mediaType, keyword, keywords,
             commentReply, dmEnabled, dmText, firstDm, thankyouDm, discountCode, linkEnabled } = req.body;
     const automation = await Automation.create({
       name, type, active, trigger, actions,
-      mediaId, keyword, keywords, commentReply, dmEnabled, dmText,
+      mediaId, mediaUrl, mediaType, keyword, keywords, commentReply, dmEnabled, dmText,
       firstDm, thankyouDm, discountCode, linkEnabled,
       userId: req.user._id,   // always from auth, never from body
     });
@@ -34,9 +34,9 @@ router.post('/', requireAuth, async (req, res) => {
 // PATCH /api/automations/:id
 router.patch('/:id', requireAuth, async (req, res) => {
   try {
-    const { name, type, active, trigger, actions, mediaId, keyword, keywords,
+    const { name, type, active, trigger, actions, mediaId, mediaUrl, mediaType, keyword, keywords,
             commentReply, dmEnabled, dmText, firstDm, thankyouDm, discountCode, linkEnabled } = req.body;
-    const allowed = { name, type, active, trigger, actions, mediaId, keyword, keywords,
+    const allowed = { name, type, active, trigger, actions, mediaId, mediaUrl, mediaType, keyword, keywords,
                       commentReply, dmEnabled, dmText, firstDm, thankyouDm, discountCode, linkEnabled };
     // Strip undefined keys so partial updates work without blanking fields
     Object.keys(allowed).forEach(k => allowed[k] === undefined && delete allowed[k]);
