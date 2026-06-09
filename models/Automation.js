@@ -24,6 +24,8 @@ const automationSchema = new mongoose.Schema({
 
   // Extra fields sent by new builder types (stored as-is, validated loosely)
   mediaId:     { type: String, default: '' },
+  mediaUrl:    { type: String, default: '' },
+  mediaType:   { type: String, default: '' }, // 'IMAGE' or 'REEL'
   keyword:     { type: String, default: '' },
   keywords:    [{ type: String }],
   commentReply:{ type: String, default: '' },
