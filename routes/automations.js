@@ -88,7 +88,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
 });
 
 // ── GET /api/automations/:id/stats — live stats for the builder page ────────
-// Returns: { triggered, dmsSent, repliesSent, dmsFailed, lastTriggeredAt }
+// Returns: { triggered, dmsSent, repliesSent, dmsFailed, lastTriggeredAt, recentLog, active }
 router.get('/:id/stats', requireAuth, async (req, res) => {
   try {
     const automation = await Automation.findOne(
@@ -98,11 +98,13 @@ router.get('/:id/stats', requireAuth, async (req, res) => {
     if (!automation) return res.status(404).json({ error: 'Automation not found.' });
     const s = automation.stats || {};
     res.json({
-      triggered:    s.triggered    || 0,
-      dmsSent:      s.dmsSent      || 0,
-      repliesSent:  s.repliesSent  || 0,
-      dmsFailed:    Math.max(0, (s.triggered || 0) - (s.dmsSent || 0)),
-      active:       automation.active,
+      triggered:       s.triggered       || 0,
+      dmsSent:         s.dmsSent         || 0,
+      repliesSent:     s.repliesSent     || 0,
+      dmsFailed:       s.failed          || 0,
+      lastTriggeredAt: s.lastTriggeredAt || null,
+      recentLog:       (s.recentLog || []).slice(0, 20),
+      active:          automation.active,
     });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error.' });
