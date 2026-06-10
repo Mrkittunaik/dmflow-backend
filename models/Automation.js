@@ -85,10 +85,18 @@ const automationSchema = new mongoose.Schema({
 
   // Stats
   stats: {
-    triggered:    { type: Number, default: 0 },
-    dmsSent:      { type: Number, default: 0 },
-    repliesSent:  { type: Number, default: 0 },
-    failed:       { type: Number, default: 0 },
+    triggered:       { type: Number, default: 0 },
+    dmsSent:         { type: Number, default: 0 },
+    repliesSent:     { type: Number, default: 0 },
+    failed:          { type: Number, default: 0 },
+    lastTriggeredAt: { type: Date, default: null },
+    // Rolling log of last 20 comment triggers (for live view in builder)
+    recentLog: [{
+      at:   { type: Date },
+      text: { type: String },   // first 80 chars of the comment
+      from: { type: String },   // commenter IG user ID
+      live: { type: Boolean, default: false },
+    }],
     // Daily log for analytics chart — each entry: { date: Date, dmsSent: Number }
     dailyLog: [{
       date:     { type: Date, required: true },
