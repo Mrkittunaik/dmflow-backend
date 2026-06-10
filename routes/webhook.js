@@ -55,9 +55,13 @@ router.post('/', async (req, res) => {
 
       // Post/reel comments → trigger automations (send DM + comment reply)
       // We do NOT store the comment itself, only the automation outcome.
+      // live_comments field covers Instagram Live stream comments.
       for (const change of (entry.changes || [])) {
         if (change.field === 'comments' && change.value) {
-          await handleComment(user, token, change.value);
+          await handleComment(user, token, change.value, false);
+        }
+        if (change.field === 'live_comments' && change.value) {
+          await handleComment(user, token, change.value, true);
         }
       }
     }
@@ -174,7 +178,12 @@ async function handleIncomingDm(user, token, event) {
 //   2. Posts a public comment reply (if the user set one up)
 // We do NOT store the comment text, commenter profile, or any reel data.
 // Stat counters on the Automation document are updated.
-async function handleComment(user, token, value) {
+//
+// isLive = true when triggered from the 'live_comments' webhook field.
+// Live automations (type=live_reply) skip the mediaId check because
+// Instagram assigns a new broadcast ID per live session — it won't
+// match the saved mediaId from when the automation was created.
+async function handleComment(user, token, value, isLive = false) {
   try {
     const commentId   = value.id;
     const commentText = value.text || '';
@@ -198,8 +207,14 @@ async function handleComment(user, token, value) {
     });
 
     for (const auto of automations) {
-      // Does this automation apply to the post/reel that was commented on?
-      const appliesToPost = !auto.mediaId || auto.applyAll || auto.mediaId === mediaId;
+      const isLiveAuto = auto.type === 'live_reply';
+
+      // mediaId check:
+      // - Live automations skip it — live broadcast IDs differ from saved reel IDs
+      // - Regular automations: must match the saved post/reel, or applyAll=true
+      const appliesToPost = (isLiveAuto && isLive)
+        ? true
+        : (!auto.mediaId || auto.applyAll || auto.mediaId === mediaId);
       if (!appliesToPost) continue;
 
       // Does the comment match the trigger keywords (or is it "all comments")?
@@ -208,9 +223,21 @@ async function handleComment(user, token, value) {
       const matched  = anyMatch || keywords.some(kw => commentText.toUpperCase().includes(kw.toUpperCase()));
       if (!matched) continue;
 
-      // Bump triggered stat
+      // Bump triggered stat + record timestamp for live activity log
       auto.stats = auto.stats || {};
       auto.stats.triggered = (auto.stats.triggered || 0) + 1;
+      auto.stats.lastTriggeredAt = new Date();
+
+      // Keep a rolling log of last 20 comment events (for live view in the builder)
+      auto.stats.recentLog = auto.stats.recentLog || [];
+      auto.stats.recentLog.unshift({
+        at:   new Date(),
+        text: commentText.substring(0, 80),
+        from: commenterId,
+        live: isLive,
+      });
+      if (auto.stats.recentLog.length > 20) auto.stats.recentLog.length = 20;
+
       auto.markModified('stats');
       await auto.save();
 
@@ -240,7 +267,7 @@ async function handleComment(user, token, value) {
           recipientId: commenterId,
           text:        dmText,
           auto,
-          triggerSource: 'comment',
+          triggerSource: isLive ? 'live_comment' : 'comment',
         });
       }
 
