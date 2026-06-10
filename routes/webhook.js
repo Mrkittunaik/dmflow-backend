@@ -304,38 +304,18 @@ async function handleComment(user, token, value, isLive = false) {
     _bumpTriggered(auto, commentText, commenterId, isLive);
     await auto.save();
 
-    // ── Public comment reply ─────────────────────────────────────────────
-    const replyText = _getCommentReplyText(auto);
-    if (replyText) {
-      try {
-        await axios.post(
-          `${IG_API}/${IG_VERSION}/${commentId}/replies`,
-          null,
-          {
-            params:  { message: replyText, access_token: token },
-            timeout: 8000,
-          }
-        );
-        auto.stats.repliesSent = (auto.stats.repliesSent || 0) + 1;
-        auto.markModified('stats');
-        await auto.save();
-        console.log(`[Webhook] 💬 Comment reply sent on comment ${commentId}`);
-      } catch (e) {
-        const errData = e.response?.data || e.message;
-        console.error('[Webhook] Comment reply failed:', errData);
-      }
-    }
-
-    // ── DM to commenter ───────────────────────────────────────────────────
+    // ── DM to commenter (comment reply is sent AFTER DM is confirmed sent) ─
     const dmText = _getDmText(auto);
     if (dmText) {
       dmQueue.enqueue(user._id, {
         token,
-        igUserId:      user.instagram.userId,
-        recipientId:   commenterId,
-        text:          dmText,
+        igUserId:          user.instagram.userId,
+        recipientId:       commenterId,
+        text:              dmText,
         auto,
-        triggerSource: isLive ? 'live_comment' : 'comment',
+        triggerSource:     isLive ? 'live_comment' : 'comment',
+        commentId,                                     // passed so queue can reply after DM
+        commentReplyText:  _getCommentReplyText(auto), // empty string = no reply
       });
     }
 
