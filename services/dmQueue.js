@@ -107,6 +107,28 @@ async function processJob(uid, job) {
     await _sendDm(token, igUserId, recipientId, text, auto);
     recordSent(uid);
 
+    // ── Post comment reply NOW that DM is confirmed sent ─────────────────
+    if (job.commentId && job.commentReplyText) {
+      try {
+        await axios.post(
+          `https://graph.instagram.com/${IG_API_VERSION}/${job.commentId}/replies`,
+          null,
+          {
+            params:  { message: job.commentReplyText, access_token: token },
+            timeout: 8000,
+          }
+        );
+        if (auto) {
+          auto.stats.repliesSent = (auto.stats.repliesSent || 0) + 1;
+          auto.markModified('stats');
+          await auto.save();
+        }
+        console.log(`[Queue] 💬 Comment reply sent after DM → comment ${job.commentId}`);
+      } catch (e) {
+        console.error('[Queue] Comment reply after DM failed:', e.response?.data || e.message);
+      }
+    }
+
     // Mark duplicate guard
     if (auto?.settings?.skipDuplicate !== false && auto?._id) {
       const guardKey = `${uid}::${auto._id}::${recipientId}`;
