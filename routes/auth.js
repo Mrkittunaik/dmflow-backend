@@ -372,6 +372,56 @@ router.get('/facebook/callback', async (req, res) => {
   }
 });
 
+// ── POST /auth/facebook/deauthorize ──────────────────────────────────────────
+// Meta calls this when a user removes your app from their Facebook settings.
+router.post('/facebook/deauthorize', async (req, res) => {
+  try {
+    const { signed_request } = req.body;
+    if (!signed_request) return res.status(400).json({ error: 'Missing signed_request.' });
+    // Decode the signed request to get the Facebook user ID
+    const [, payload] = signed_request.split('.');
+    const decoded = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+    const fbId = decoded?.user_id;
+    if (fbId) {
+      // Clear Facebook data from user
+      await User.findOneAndUpdate({ 'facebook.id': fbId }, {
+        $unset: { facebook: '' }
+      });
+      console.log(`Facebook deauthorized for FB user ${fbId}`);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('facebook/deauthorize error:', err.message);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// ── POST /auth/facebook/delete ────────────────────────────────────────────────
+// Meta calls this when a user requests their data be deleted.
+router.post('/facebook/delete', async (req, res) => {
+  try {
+    const { signed_request } = req.body;
+    if (!signed_request) return res.status(400).json({ error: 'Missing signed_request.' });
+    const [, payload] = signed_request.split('.');
+    const decoded = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+    const fbId = decoded?.user_id;
+    if (fbId) {
+      await User.findOneAndUpdate({ 'facebook.id': fbId }, {
+        $unset: { facebook: '' }
+      });
+      console.log(`Facebook data deletion request for FB user ${fbId}`);
+    }
+    // Meta requires a confirmation URL in the response
+    res.json({
+      url: `${process.env.FRONTEND_URL}/pages/settings/privacy.html`,
+      confirmation_code: fbId || 'deleted',
+    });
+  } catch (err) {
+    console.error('facebook/delete error:', err.message);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
 // ── GET /auth/instagram/url ──────────────────────────────────────────────────
 // Returns the Instagram OAuth URL with ALL required scopes.
 router.get('/instagram/url', requireAuth, async (req, res) => {
