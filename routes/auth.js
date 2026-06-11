@@ -262,6 +262,22 @@ router.get('/google/token', (req, res) => {
   res.json({ token: entry.token });
 });
 
+// ── GET /auth/facebook/token ─────────────────────────────────────────────────
+// Exchanges one-time code for JWT — same pattern as /auth/google/token
+router.get('/facebook/token', (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).json({ error: 'Missing code.' });
+  const store = req.app.locals.oauthCodes || {};
+  const entry = store[code];
+  if (!entry || Date.now() > entry.expires) {
+    delete store[code];
+    return res.status(400).json({ error: 'Code expired or invalid.' });
+  }
+  delete store[code];
+  res.cookie('dmflow_token', entry.token, cookieOptions());
+  res.json({ token: entry.token });
+});
+
 // ── GET /auth/facebook ───────────────────────────────────────────────────────
 // Redirects user to Facebook OAuth consent screen.
 router.get('/facebook', (req, res) => {
