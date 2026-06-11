@@ -38,7 +38,7 @@ app.use(cookieParser());
 require('./config/passport')(passport);
 app.use(passport.initialize());
 
-// ── Activity tracker — must be BEFORE routes so every real request is counted
+// ── Activity tracker ───────────────────────────────────────
 let _lastUserActivityAt = Date.now();
 app.use((req, res, next) => {
   const isSelfPing = req.headers['x-self-ping'] === '1';
@@ -82,6 +82,20 @@ app.use('/api/billing',     apiLimiter,  require('./routes/billing'));
 app.use('/api/hr',          apiLimiter,  require('./routes/hr'));
 app.use('/api/roles',       apiLimiter,  require('./routes/roles'));
 app.use('/api/joiner',      apiLimiter,  require('./routes/joiner'));
+
+// ── TEMP: Fix wrong Instagram user IDs in DB — remove after running once ────
+app.get('/fix-ig-id', async (req, res) => {
+  try {
+    const User = require('./models/User');
+    const result = await User.updateMany(
+      { 'instagram.userId': '27493722246899687' },
+      { $set: { 'instagram.userId': '17841438124324017' } }
+    );
+    res.json({ fixed: result.modifiedCount });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ── Health check ────────────────────────────────────────────
 app.get('/health', (req, res) => {
