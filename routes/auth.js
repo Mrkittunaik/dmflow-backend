@@ -357,7 +357,7 @@ router.get('/instagram/callback', async (req, res) => {
           timeout: 8000,
         }
       );
-      ({ username, name, profile_picture_url, account_type } = profileRes.data);
+     ({ id: igUserId, username, name, profile_picture_url, account_type } = profileRes.data);
     } catch (e) {
       console.error('IG profile fetch failed:', e.response?.data || e.message);
       return res.redirect(`${REDIRECT_BASE}?error=profile_fetch_failed`);
