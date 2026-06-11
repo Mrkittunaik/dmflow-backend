@@ -71,10 +71,21 @@ async function processEntry(entry) {
   const igAccountId = entry.id;
 
   // Load the user that owns this IG account
-  const user = await User.findOne({ 'instagram.userId': igAccountId });
+  const user = await User.findOne({
+    $or: [
+      { 'instagram.userId': igAccountId },
+      { 'instagram.webhookUserId': igAccountId }
+    ]
+  });
   if (!user || !user.instagram?.connected) {
     console.log(`[Webhook] No connected user for IG account ${igAccountId} — skipping`);
     return;
+  }
+  // Save webhookUserId on first match so future lookups are fast
+  if (!user.instagram.webhookUserId || user.instagram.webhookUserId !== igAccountId) {
+    await User.findByIdAndUpdate(user._id, {
+      'instagram.webhookUserId': igAccountId
+    });
   }
 
   const token = user.decryptIgToken();
@@ -304,18 +315,38 @@ async function handleComment(user, token, value, isLive = false) {
     _bumpTriggered(auto, commentText, commenterId, isLive);
     await auto.save();
 
-    // ── DM to commenter (comment reply is sent AFTER DM is confirmed sent) ─
+    // ── Public comment reply ─────────────────────────────────────────────
+    const replyText = _getCommentReplyText(auto);
+    if (replyText) {
+      try {
+        await axios.post(
+          `${IG_API}/${IG_VERSION}/${commentId}/replies`,
+          null,
+          {
+            params:  { message: replyText, access_token: token },
+            timeout: 8000,
+          }
+        );
+        auto.stats.repliesSent = (auto.stats.repliesSent || 0) + 1;
+        auto.markModified('stats');
+        await auto.save();
+        console.log(`[Webhook] 💬 Comment reply sent on comment ${commentId}`);
+      } catch (e) {
+        const errData = e.response?.data || e.message;
+        console.error('[Webhook] Comment reply failed:', errData);
+      }
+    }
+
+    // ── DM to commenter ───────────────────────────────────────────────────
     const dmText = _getDmText(auto);
     if (dmText) {
       dmQueue.enqueue(user._id, {
         token,
-        igUserId:          user.instagram.userId,
-        recipientId:       commenterId,
-        text:              dmText,
+        igUserId:      user.instagram.userId,
+        recipientId:   commenterId,
+        text:          dmText,
         auto,
-        triggerSource:     isLive ? 'live_comment' : 'comment',
-        commentId,                                     // passed so queue can reply after DM
-        commentReplyText:  _getCommentReplyText(auto), // empty string = no reply
+        triggerSource: isLive ? 'live_comment' : 'comment',
       });
     }
 
