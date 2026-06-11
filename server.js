@@ -84,6 +84,20 @@ app.use('/api/hr',          apiLimiter,  require('./routes/hr'));
 app.use('/api/roles',       apiLimiter,  require('./routes/roles'));
 app.use('/api/joiner',      apiLimiter,  require('./routes/joiner'));
 
+// ── TEMP DEBUG — remove after fixing ───────────────────────
+app.get('/debug-ig', async (req, res) => {
+  try {
+    const User = require('./models/User');
+    const users = await User.find(
+      {},
+      { email: 1, 'instagram.userId': 1, 'instagram.username': 1, 'instagram.connected': 1, 'instagram.webhookSubscribed': 1 }
+    );
+    res.json(users);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Health check ────────────────────────────────────────────
 app.get('/health', (req, res) => {
   let queueStatus = {};
@@ -112,14 +126,9 @@ mongoose.connect(process.env.MONGO_URI)
     app.listen(PORT, () => {
       console.log(`🚀  Server running on http://localhost:${PORT}`);
 
-      // ── Smart self-ping ─────────────────────────────────────────────────
-      // Keeps Render free tier awake (spins down after 15 min idle).
-      // Pings every 10 min while users are active.
-      // Pauses after 1 hr of zero real user traffic to save resources.
-      // Auto-resumes the moment any real user request comes in.
       const BACKEND_URL   = process.env.BACKEND_URL || `http://localhost:${PORT}`;
-      const IDLE_STOP_MS  = 60 * 60 * 1000; // 1 hour
-      const PING_INTERVAL = 10 * 60 * 1000; // 10 minutes
+      const IDLE_STOP_MS  = 60 * 60 * 1000;
+      const PING_INTERVAL = 10 * 60 * 1000;
       const axios         = require('axios');
       let _pingTimer      = null;
       let _pingPaused     = false;
@@ -131,7 +140,7 @@ mongoose.connect(process.env.MONGO_URI)
           if (idleMs >= IDLE_STOP_MS) {
             _pingPaused = true;
             console.log('💤  Self-ping paused — no user activity for 1 hr');
-            return; // don't reschedule; _resumeSelfPing() will restart it
+            return;
           }
           try {
             await axios.get(`${BACKEND_URL}/health`, {
@@ -146,7 +155,6 @@ mongoose.connect(process.env.MONGO_URI)
         }, PING_INTERVAL);
       }
 
-      // Called by activity middleware when a real user wakes the server back up
       global._resumeSelfPing = function() {
         if (_pingPaused && !_pingTimer) {
           _pingPaused = false;
@@ -155,7 +163,7 @@ mongoose.connect(process.env.MONGO_URI)
         }
       };
 
-      schedulePing(); // kick off on boot
+      schedulePing();
     });
   })
   .catch(err => {
