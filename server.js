@@ -44,7 +44,6 @@ app.use((req, res, next) => {
   const isSelfPing = req.headers['x-self-ping'] === '1';
   if (!isSelfPing && req.path !== '/health') {
     _lastUserActivityAt = Date.now();
-    // If self-ping was paused, restart it now that a real user is back
     if (typeof _resumeSelfPing === 'function') _resumeSelfPing();
   }
   next();
@@ -69,7 +68,7 @@ const apiLimiter = rateLimit({
 });
 
 // ── Routes ─────────────────────────────────────────────────
-app.use('/webhook',         require('./routes/webhook'));   // No rate limiter — Meta needs fast 200
+app.use('/webhook',         require('./routes/webhook'));
 app.use('/auth',            authLimiter, require('./routes/auth'));
 app.use('/api/user',        apiLimiter,  require('./routes/user'));
 app.use('/api/automations', apiLimiter,  require('./routes/automations'));
@@ -83,20 +82,6 @@ app.use('/api/billing',     apiLimiter,  require('./routes/billing'));
 app.use('/api/hr',          apiLimiter,  require('./routes/hr'));
 app.use('/api/roles',       apiLimiter,  require('./routes/roles'));
 app.use('/api/joiner',      apiLimiter,  require('./routes/joiner'));
-
-// ── TEMP DEBUG — remove after fixing ───────────────────────
-app.get('/debug-ig', async (req, res) => {
-  try {
-    const User = require('./models/User');
-    const users = await User.find(
-      {},
-      { email: 1, 'instagram.userId': 1, 'instagram.username': 1, 'instagram.connected': 1, 'instagram.webhookSubscribed': 1 }
-    );
-    res.json(users);
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // ── Health check ────────────────────────────────────────────
 app.get('/health', (req, res) => {
