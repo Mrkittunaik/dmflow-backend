@@ -338,9 +338,10 @@ async function handleComment(user, token, value, isLive = false) {
     }
 
     // ── DM to commenter ───────────────────────────────────────────────────
-    const dmText = _getDmText(auto);
-    if (dmText) {
-      dmQueue.enqueue(user._id, {
+ const dmText = _getDmText(auto);
+console.log(`[Webhook] DM debug — dmText: "${dmText}", commenterId: ${commenterId}, autoId: ${auto._id}`);
+if (dmText) {
+  dmQueue.enqueue(user._id, {
         token,
         igUserId:      user.instagram.userId,
         recipientId:   commenterId,
