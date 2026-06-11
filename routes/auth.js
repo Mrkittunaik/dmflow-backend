@@ -262,6 +262,116 @@ router.get('/google/token', (req, res) => {
   res.json({ token: entry.token });
 });
 
+// ── GET /auth/facebook ───────────────────────────────────────────────────────
+// Redirects user to Facebook OAuth consent screen.
+router.get('/facebook', (req, res) => {
+  const clientId    = process.env.FACEBOOK_APP_ID;
+  const redirectUri = encodeURIComponent(process.env.FACEBOOK_REDIRECT_URI);
+  const scope       = encodeURIComponent('email,public_profile');
+  const state       = crypto.randomBytes(16).toString('hex');
+  // Store state in app.locals to verify on callback (CSRF protection)
+  req.app.locals.fbStates = req.app.locals.fbStates || {};
+  req.app.locals.fbStates[state] = Date.now() + 10 * 60 * 1000; // 10 min expiry
+  const url = `https://www.facebook.com/v21.0/dialog/oauth?client_id=${clientId}&redirect_uri=${redirectUri}&scope=${scope}&state=${state}&response_type=code`;
+  res.redirect(url);
+});
+
+// ── GET /auth/facebook/callback ───────────────────────────────────────────────
+// Exchanges code for token, finds/creates user, issues DMFlow JWT.
+router.get('/facebook/callback', async (req, res) => {
+  const REDIRECT_BASE = `${process.env.FRONTEND_URL}/pages/oauth/oauth-callback.html`;
+
+  try {
+    const { code, state, error } = req.query;
+
+    if (error || !code)
+      return res.redirect(`${process.env.FRONTEND_URL}/pages/auth/login.html?error=facebook`);
+
+    // ── Verify CSRF state ────────────────────────────────────────────────────
+    const states = req.app.locals.fbStates || {};
+    if (!state || !states[state] || Date.now() > states[state]) {
+      delete states[state];
+      return res.redirect(`${process.env.FRONTEND_URL}/pages/auth/login.html?error=facebook`);
+    }
+    delete states[state];
+
+    // ── Step 1: Exchange code for access token ───────────────────────────────
+    let accessToken;
+    try {
+      const tokenRes = await axios.get('https://graph.facebook.com/v21.0/oauth/access_token', {
+        params: {
+          client_id:     process.env.FACEBOOK_APP_ID,
+          client_secret: process.env.FACEBOOK_APP_SECRET,
+          redirect_uri:  process.env.FACEBOOK_REDIRECT_URI,
+          code,
+        },
+        timeout: 10000,
+      });
+      accessToken = tokenRes.data.access_token;
+    } catch (e) {
+      console.error('Facebook token exchange failed:', e.response?.data || e.message);
+      return res.redirect(`${process.env.FRONTEND_URL}/pages/auth/login.html?error=facebook`);
+    }
+
+    // ── Step 2: Fetch Facebook profile ──────────────────────────────────────
+    let fbId, fbName, fbEmail, fbPicture;
+    try {
+      const profileRes = await axios.get('https://graph.facebook.com/v21.0/me', {
+        params: {
+          fields:       'id,name,email,picture.type(large)',
+          access_token: accessToken,
+        },
+        timeout: 8000,
+      });
+      fbId      = profileRes.data.id;
+      fbName    = profileRes.data.name;
+      fbEmail   = profileRes.data.email;
+      fbPicture = profileRes.data.picture?.data?.url || '';
+    } catch (e) {
+      console.error('Facebook profile fetch failed:', e.response?.data || e.message);
+      return res.redirect(`${process.env.FRONTEND_URL}/pages/auth/login.html?error=facebook`);
+    }
+
+    // ── Step 3: Find or create user ──────────────────────────────────────────
+    let user = null;
+
+    // 1) Match by Facebook ID
+    user = await User.findOne({ 'facebook.id': fbId });
+
+    // 2) Match by email (link accounts)
+    if (!user && fbEmail) {
+      user = await User.findOne({ email: fbEmail.toLowerCase() });
+    }
+
+    // 3) Create new user
+    if (!user) {
+      user = await User.create({
+        name:     fbName,
+        email:    fbEmail?.toLowerCase() || `fb_${fbId}@dmflow.in`,
+        password: null, // no password for social login
+        avatar:   fbPicture,
+        facebook: { id: fbId, name: fbName, email: fbEmail, picture: fbPicture },
+      });
+    } else {
+      // Update Facebook info on existing user
+      user.facebook = { id: fbId, name: fbName, email: fbEmail, picture: fbPicture };
+      if (!user.avatar) user.avatar = fbPicture;
+      await user.save();
+    }
+
+    // ── Step 4: Issue DMFlow JWT via one-time code (same as Google) ──────────
+    const token = makeToken(user);
+    const code2 = crypto.randomBytes(24).toString('hex');
+    req.app.locals.oauthCodes = req.app.locals.oauthCodes || {};
+    req.app.locals.oauthCodes[code2] = { token, expires: Date.now() + 60_000 };
+
+    res.redirect(`${REDIRECT_BASE}?code=${code2}&provider=facebook`);
+  } catch (err) {
+    console.error('Facebook callback error:', err.message);
+    res.redirect(`${process.env.FRONTEND_URL}/pages/auth/login.html?error=facebook`);
+  }
+});
+
 // ── GET /auth/instagram/url ──────────────────────────────────────────────────
 // Returns the Instagram OAuth URL with ALL required scopes.
 router.get('/instagram/url', requireAuth, async (req, res) => {
