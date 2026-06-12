@@ -11,7 +11,7 @@
 //   1. Always 200 immediately — Meta retries if we're slow
 //   2. All DMs go through dmQueue (rate-limited, deduplicated)
 //   3. Never send DMs to yourself (owner account)
-//   4. Comment replies use query-param format (not JSON body)
+//   4. Comment replies are enqueued WITH the DM job (sent after DM succeeds)
 //   5. Full error isolation — one bad event never kills others
 //   6. Every trigger logs to automation.stats for the analytics dashboard
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,6 +27,19 @@ const dmQueue    = require('../services/dmQueue');
 
 const IG_API     = 'https://graph.instagram.com';
 const IG_VERSION = 'v21.0';
+
+// ── In-process comment dedup guard ───────────────────────────────────────────
+// Prevents duplicate comment replies when Meta re-delivers the same event.
+// Key: commentId, Value: timestamp of first processing
+// FIX #1 / #9: deduplication for comment events (mirrors DM igMsgId guard)
+const processedComments = new Map();
+// Clean up entries older than 48 hours every hour
+setInterval(() => {
+  const cutoff = Date.now() - 48 * 3600 * 1000;
+  for (const [k, ts] of processedComments.entries()) {
+    if (ts < cutoff) processedComments.delete(k);
+  }
+}, 3600 * 1000);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /webhook — Meta verification handshake
@@ -95,11 +108,23 @@ async function processEntry(entry) {
   }
 
   // ── Direct Messages ────────────────────────────────────────────────────────
+  // FIX #4: Story replies arrive in entry.messaging too. Track which events we
+  // handle as story replies so we do NOT also process them as plain DMs.
+  const storyReplyEventIds = new Set();
+
   for (const msgEvent of (entry.messaging || [])) {
     if (!msgEvent.message) continue;
-
-    // is_echo = message sent BY the account (not received)
     if (msgEvent.message.is_echo) continue;
+
+    // FIX #4: If this is a story reply, mark it and skip the DM handler here.
+    // handleStoryReply calls handleIncomingDm internally — no double processing.
+    if (msgEvent.message?.reply_to) {
+      storyReplyEventIds.add(msgEvent.sender?.id + ':' + (msgEvent.message?.mid || ''));
+      await handleStoryReply(user, token, msgEvent).catch(err =>
+        console.error('[Webhook] handleStoryReply (messaging) error:', err.message)
+      );
+      continue; // do NOT also call handleIncomingDm for this event
+    }
 
     await handleIncomingDm(user, token, msgEvent).catch(err =>
       console.error('[Webhook] handleIncomingDm error:', err.message)
@@ -134,15 +159,8 @@ async function processEntry(entry) {
       }
     }
   }
-
-  // ── Story replies (some API versions deliver these in entry.messaging too) ─
-  for (const msgEvent of (entry.messaging || [])) {
-    if (!msgEvent.message?.is_echo && msgEvent.message?.reply_to) {
-      await handleStoryReply(user, token, msgEvent).catch(err =>
-        console.error('[Webhook] handleStoryReply (messaging) error:', err.message)
-      );
-    }
-  }
+  // NOTE: The old second loop over entry.messaging for story replies is removed.
+  // It caused every story reply to be processed twice (FIX #4).
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -225,7 +243,8 @@ async function handleIncomingDm(user, token, event) {
     const matched  = anyMatch || keywords.some(kw => text.toUpperCase().includes(kw.toUpperCase()));
     if (!matched) continue;
 
-    // Reload live doc so stats save correctly (lean() gives plain object)
+    // FIX #7: Always reload a fresh Mongoose doc from DB — never mutate the
+    // .lean() plain object or a shared reference from another code path.
     const liveAuto = await Automation.findById(auto._id);
     if (!liveAuto) continue;
 
@@ -239,7 +258,7 @@ async function handleIncomingDm(user, token, event) {
         igUserId:      user.instagram.userId,
         recipientId:   senderId,
         text:          dmText,
-        auto:          liveAuto,
+        autoId:        liveAuto._id.toString(), // FIX #7: pass ID not live doc
         triggerSource: 'dm',
       });
     }
@@ -262,9 +281,11 @@ async function handleIncomingDm(user, token, event) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // handleComment
-// - Posts public comment reply (if automation has one)
-// - Enqueues DM to commenter
+// - Enqueues DM to commenter (comment reply is sent AFTER DM, inside the queue)
 // - isLive = true for live_comments field
+// FIX #2: comment reply is no longer sent inline here — it's attached to the
+//         queue job so it fires only after the DM succeeds.
+// FIX #1/#9: commentId deduplication guard prevents double-fire on Meta retry.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleComment(user, token, value, isLive = false) {
   const commentId   = value.id;
@@ -274,11 +295,22 @@ async function handleComment(user, token, value, isLive = false) {
 
   if (!commenterId || !commentText || !commentId) return;
 
+  // FIX #1 / #9: Deduplicate comment events — Meta re-delivers the same event
+  const commentDedupeKey = `${user._id}::${commentId}`;
+  if (processedComments.has(commentDedupeKey)) {
+    console.log(`[Webhook] 🚫 Duplicate comment event blocked: ${commentId}`);
+    return;
+  }
+  processedComments.set(commentDedupeKey, Date.now());
+
   // Never react to your own comments
   if (commenterId === user.instagram.userId) {
     console.log(`[Webhook] Skipping self-comment by owner on media ${mediaId}`);
     return;
   }
+
+  // FIX #12: Validate comment reply length before sending (Instagram limit ~2200 chars)
+  // (checked below when replyText is resolved)
 
   const automations = await Automation.find({
     userId: user._id,
@@ -292,17 +324,25 @@ async function handleComment(user, token, value, isLive = false) {
         'live_reply',
       ],
     },
-  });
+  }).lean(); // FIX #7: use .lean() to get plain objects; reload fresh doc before saving
 
   for (const auto of automations) {
     const isLiveAuto = auto.type === 'live_reply';
 
     // ── Post/media match check ──────────────────────────────────────────────
-    // Live automations skip mediaId check — broadcast ID changes every session
-    // Regular: must match saved mediaId, OR applyAll = true, OR no mediaId saved
-    const appliesToPost = isLiveAuto && isLive
-      ? true
-      : (!auto.mediaId || auto.applyAll || auto.mediaId === mediaId);
+    // FIX #5: Empty string mediaId ('') was falsy — now we require applyAll OR
+    // an explicit match. An empty mediaId with applyAll=false does NOT match all.
+    let appliesToPost;
+    if (isLiveAuto && isLive) {
+      appliesToPost = true; // Live automations skip mediaId check
+    } else if (auto.applyAll) {
+      appliesToPost = true;
+    } else if (auto.mediaId && auto.mediaId !== '') {
+      appliesToPost = auto.mediaId === mediaId;
+    } else {
+      // No mediaId set and applyAll=false — skip (don't match everything)
+      appliesToPost = false;
+    }
     if (!appliesToPost) continue;
 
     // ── Keyword match ─────────────────────────────────────────────────────
@@ -311,43 +351,38 @@ async function handleComment(user, token, value, isLive = false) {
     const matched  = anyMatch || keywords.some(kw => commentText.toUpperCase().includes(kw.toUpperCase()));
     if (!matched) continue;
 
-    // ── Stats ─────────────────────────────────────────────────────────────
-    _bumpTriggered(auto, commentText, commenterId, isLive);
-    await auto.save();
+    // FIX #7/#8: Reload fresh doc before mutating stats
+    const liveAuto = await Automation.findById(auto._id);
+    if (!liveAuto) continue;
 
-    // ── Public comment reply ─────────────────────────────────────────────
-    const replyText = _getCommentReplyText(auto);
-    if (replyText) {
-      try {
-        await axios.post(
-          `${IG_API}/${IG_VERSION}/${commentId}/replies`,
-          null,
-          {
-            params:  { message: replyText, access_token: token },
-            timeout: 8000,
-          }
-        );
-        auto.stats.repliesSent = (auto.stats.repliesSent || 0) + 1;
-        auto.markModified('stats');
-        await auto.save();
-        console.log(`[Webhook] 💬 Comment reply sent on comment ${commentId}`);
-      } catch (e) {
-        const errData = e.response?.data || e.message;
-        console.error('[Webhook] Comment reply failed:', errData);
-      }
+    // ── Stats ─────────────────────────────────────────────────────────────
+    _bumpTriggered(liveAuto, commentText, commenterId, isLive);
+    await liveAuto.save();
+
+    // ── Comment reply text ────────────────────────────────────────────────
+    const replyText = _getCommentReplyText(liveAuto);
+
+    // FIX #12: Warn if reply text exceeds Instagram limit
+    if (replyText && replyText.length > 2200) {
+      console.warn(`[Webhook] ⚠️ Comment reply for automation ${liveAuto._id} exceeds 2200 chars (${replyText.length}). Instagram may reject it.`);
     }
 
     // ── DM to commenter ───────────────────────────────────────────────────
-    const dmText = _getDmText(auto);
-    console.log(`[Webhook] DM debug — dmText: "${dmText}", commenterId: ${commenterId}, autoId: ${auto._id}`);
-    if (dmText) {
+    // FIX #2: Comment reply is attached to the queue job and sent AFTER the DM
+    // succeeds — no longer fired inline here before the DM is sent.
+    const dmText = _getDmText(liveAuto);
+    console.log(`[Webhook] DM debug — dmText: "${dmText}", commenterId: ${commenterId}, autoId: ${liveAuto._id}`);
+
+    if (dmText || replyText) {
       dmQueue.enqueue(user._id, {
         token,
-        igUserId:      user.instagram.userId,
-        recipientId:   commenterId,
-        text:          dmText,
-        auto,
-        triggerSource: isLive ? 'live_comment' : 'comment',
+        igUserId:         user.instagram.userId,
+        recipientId:      commenterId,
+        text:             dmText,
+        autoId:           liveAuto._id.toString(), // FIX #7: ID not live doc
+        commentId:        replyText ? commentId : null,   // FIX #2
+        commentReplyText: replyText || null,               // FIX #2
+        triggerSource:    isLive ? 'live_comment' : 'comment',
       });
     }
 
@@ -370,20 +405,23 @@ async function handleMention(user, token, value) {
     userId: user._id,
     active: true,
     'trigger.onMention': true,
-  });
+  }).lean();
 
   for (const auto of automations) {
-    _bumpTriggered(auto, '@mention', mentionerId, false);
-    await auto.save();
+    const liveAuto = await Automation.findById(auto._id);
+    if (!liveAuto) continue;
 
-    const dmText = _getDmText(auto);
+    _bumpTriggered(liveAuto, '@mention', mentionerId, false);
+    await liveAuto.save();
+
+    const dmText = _getDmText(liveAuto);
     if (dmText) {
       dmQueue.enqueue(user._id, {
         token,
         igUserId:      user.instagram.userId,
         recipientId:   mentionerId,
         text:          dmText,
-        auto,
+        autoId:        liveAuto._id.toString(),
         triggerSource: 'mention',
       });
     }
@@ -394,6 +432,8 @@ async function handleMention(user, token, value) {
 // ─────────────────────────────────────────────────────────────────────────────
 // handleStoryReply
 // - Fires automations with trigger.onStoryReply = true
+// FIX #4: This function is the ONLY place story replies are handled.
+//         processEntry no longer calls handleIncomingDm separately for them.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleStoryReply(user, token, event) {
   const senderId = event.sender?.id;
@@ -401,7 +441,7 @@ async function handleStoryReply(user, token, event) {
 
   if (!senderId || senderId === user.instagram.userId) return;
 
-  // Save the reply to inbox thread too
+  // Save the reply to inbox thread (single call — not duplicated)
   await handleIncomingDm(user, token, event);
 
   const automations = await Automation.find({
@@ -412,7 +452,7 @@ async function handleStoryReply(user, token, event) {
       { type: 'story_reaction_dm' },
       { 'trigger.onStoryReply': true },
     ],
-  });
+  }).lean();
 
   for (const auto of automations) {
     const keywords = auto.trigger?.keywords || (auto.keyword ? [auto.keyword] : []);
@@ -420,17 +460,20 @@ async function handleStoryReply(user, token, event) {
     const matched  = anyMatch || keywords.some(kw => text.toUpperCase().includes(kw.toUpperCase()));
     if (!matched) continue;
 
-    _bumpTriggered(auto, text, senderId, false);
-    await auto.save();
+    const liveAuto = await Automation.findById(auto._id);
+    if (!liveAuto) continue;
 
-    const dmText = _getDmText(auto);
+    _bumpTriggered(liveAuto, text, senderId, false);
+    await liveAuto.save();
+
+    const dmText = _getDmText(liveAuto);
     if (dmText) {
       dmQueue.enqueue(user._id, {
         token,
         igUserId:      user.instagram.userId,
         recipientId:   senderId,
         text:          dmText,
-        auto,
+        autoId:        liveAuto._id.toString(),
         triggerSource: 'story_reply',
       });
     }
@@ -460,9 +503,11 @@ function _bumpTriggered(auto, text, fromId, isLive) {
   auto.markModified('stats');
 }
 
-// Get DM text — supports new actions.dm.message and all legacy field names
+// FIX #13: _getDmText now correctly reads actions.dm.text (not .message)
+// Falls back to legacy dmText / firstDm fields for old documents.
 function _getDmText(auto) {
-  if (auto.actions?.dm?.message) return auto.actions.dm.message;
+  if (auto.actions?.dm?.text) return auto.actions.dm.text;       // new schema field
+  if (auto.actions?.dm?.message) return auto.actions.dm.message; // legacy alias (if any)
   return auto.dmText || auto.firstDm || '';
 }
 
