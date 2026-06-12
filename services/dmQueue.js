@@ -10,10 +10,33 @@
 //   3. Enforces per-user hourly cap (default 100, max 200)
 //   4. Blocks duplicate sends within a configurable window
 //   5. Keeps running even when no web traffic (Render doesn't kill this)
+//
+// FIX #2:  Comment reply is sent AFTER DM succeeds (job carries commentId +
+//          commentReplyText set by webhook.js).
+// FIX #3:  Stats are updated via atomic $inc (findByIdAndUpdate) so concurrent
+//          saves on different in-memory copies cannot overwrite each other.
+// FIX #6:  sentGuard is backed by MongoDB (ProcessedDm collection) so it
+//          survives server restarts / Render sleep-wake cycles.
+// FIX #7:  Jobs carry autoId (string) not a live Mongoose doc. The queue
+//          reloads the doc fresh when it needs to save stats.
+// FIX #10: {{name}} placeholder is resolved from recipient's IG profile, not
+//          silently erased.
 
-const axios = require('axios');
+const axios     = require('axios');
+const mongoose  = require('mongoose');
 
 const IG_API_VERSION = 'v21.0';
+
+// ── Persistent dedup store ────────────────────────────────────────────────────
+// FIX #6: Replace in-memory sentGuard Map with a MongoDB collection so the
+// guard survives restarts.  Schema: { key: String, sentAt: Date (TTL index) }
+const processedDmSchema = new mongoose.Schema({
+  key:    { type: String, required: true, unique: true },
+  sentAt: { type: Date, default: Date.now, expires: 7 * 24 * 3600 }, // TTL 7 days
+});
+// Guard against model re-registration during hot-reload
+const ProcessedDm = mongoose.models.ProcessedDm ||
+  mongoose.model('ProcessedDm', processedDmSchema);
 
 // ── Per-user job queues ───────────────────────────────────────────────────────
 // Map<userId_string, Job[]>
@@ -23,33 +46,31 @@ const queues = new Map();
 // Map<userId_string, { count: Number, windowStart: Number }>
 const hourlyTracker = new Map();
 
-// ── Duplicate send guard ──────────────────────────────────────────────────────
-// Map<`${userId}::${autoId}::${recipientId}`, timestamp_ms>
-const sentGuard = new Map();
-// Clean sentGuard every hour so it doesn't grow unbounded
-setInterval(() => {
-  const cutoff = Date.now() - 7 * 24 * 3600 * 1000; // keep 7 days max
-  for (const [k, ts] of sentGuard.entries()) {
-    if (ts < cutoff) sentGuard.delete(k);
-  }
-}, 3600 * 1000);
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  PUBLIC: enqueue(userId, job)
-//  job = { token, igUserId, recipientId, text, auto, triggerSource }
+//  job = { token, igUserId, recipientId, text, autoId, commentId?,
+//          commentReplyText?, triggerSource }
+//  FIX #7: job carries autoId (string), NOT a live Mongoose doc.
 // ─────────────────────────────────────────────────────────────────────────────
-function enqueue(userId, job) {
+async function enqueue(userId, job) {
   const uid = userId.toString();
 
-  // ── Duplicate guard ───────────────────────────────────────────────────────
-  const skipDup   = job.auto?.settings?.skipDuplicate !== false; // default true
-  const dupWindow = (job.auto?.settings?.duplicateWindowHours ?? 24) * 3600 * 1000;
-  if (skipDup && job.auto?._id) {
-    const guardKey = `${uid}::${job.auto._id}::${job.recipientId}`;
-    const lastSent = sentGuard.get(guardKey);
-    if (lastSent && Date.now() - lastSent < dupWindow) {
-      console.log(`[Queue] 🚫 Duplicate blocked → user ${uid}, recipient ${job.recipientId}`);
-      return;
+  // ── Duplicate guard (FIX #6: DB-backed) ──────────────────────────────────
+  if (job.autoId) {
+    // Load settings from DB to check skipDuplicate / duplicateWindowHours
+    const Automation = require('../models/Automation');
+    const autoSettings = await Automation.findById(job.autoId, 'settings').lean();
+    const skipDup   = autoSettings?.settings?.skipDuplicate !== false; // default true
+    const dupWindow = (autoSettings?.settings?.duplicateWindowHours ?? 24) * 3600 * 1000;
+
+    if (skipDup) {
+      const guardKey  = `${uid}::${job.autoId}::${job.recipientId}`;
+      const cutoff    = new Date(Date.now() - dupWindow);
+      const existing  = await ProcessedDm.findOne({ key: guardKey, sentAt: { $gte: cutoff } });
+      if (existing) {
+        console.log(`[Queue] 🚫 Duplicate blocked → user ${uid}, recipient ${job.recipientId}`);
+        return;
+      }
     }
   }
 
@@ -92,7 +113,12 @@ function getHourlyUsage(uid) {
 //  INTERNAL: process one job
 // ─────────────────────────────────────────────────────────────────────────────
 async function processJob(uid, job) {
-  const { token, igUserId, recipientId, text, auto } = job;
+  const { token, igUserId, recipientId, text } = job;
+
+  // FIX #7: Load fresh automation doc for settings; never use a shared reference
+  const Automation = require('../models/Automation');
+  const auto = job.autoId ? await Automation.findById(job.autoId) : null;
+
   const maxPerHour = auto?.settings?.maxDmsPerHour ?? 100;
 
   if (!canSend(uid, maxPerHour)) {
@@ -107,8 +133,14 @@ async function processJob(uid, job) {
     await _sendDm(token, igUserId, recipientId, text, auto);
     recordSent(uid);
 
-    // ── Post comment reply NOW that DM is confirmed sent ─────────────────
+    // FIX #2: Post comment reply AFTER DM is confirmed sent.
+    // webhook.js no longer fires the reply inline — it passes commentId +
+    // commentReplyText on the job so we control the order here.
     if (job.commentId && job.commentReplyText) {
+      // FIX #12: Warn if comment reply length may be rejected by Instagram
+      if (job.commentReplyText.length > 2200) {
+        console.warn(`[Queue] ⚠️ Comment reply text is ${job.commentReplyText.length} chars (limit ~2200). Instagram may reject it.`);
+      }
       try {
         await axios.post(
           `https://graph.instagram.com/${IG_API_VERSION}/${job.commentId}/replies`,
@@ -118,10 +150,11 @@ async function processJob(uid, job) {
             timeout: 8000,
           }
         );
-        if (auto) {
-          auto.stats.repliesSent = (auto.stats.repliesSent || 0) + 1;
-          auto.markModified('stats');
-          await auto.save();
+        // FIX #3: Use atomic $inc to update repliesSent — no race condition
+        if (job.autoId) {
+          await Automation.findByIdAndUpdate(job.autoId, {
+            $inc: { 'stats.repliesSent': 1 }
+          });
         }
         console.log(`[Queue] 💬 Comment reply sent after DM → comment ${job.commentId}`);
       } catch (e) {
@@ -129,21 +162,25 @@ async function processJob(uid, job) {
       }
     }
 
-    // Mark duplicate guard
-    if (auto?.settings?.skipDuplicate !== false && auto?._id) {
-      const guardKey = `${uid}::${auto._id}::${recipientId}`;
-      sentGuard.set(guardKey, Date.now());
+    // FIX #6: Persist duplicate guard to DB so it survives restarts
+    if (job.autoId) {
+      const guardKey = `${uid}::${job.autoId}::${recipientId}`;
+      await ProcessedDm.findOneAndUpdate(
+        { key: guardKey },
+        { sentAt: new Date() },
+        { upsert: true }
+      );
     }
 
-    // Update automation stats
-    await _updateStats(auto, true);
+    // FIX #3: Update dmsSent via atomic $inc — no shared-doc race condition
+    await _updateStats(job.autoId, true);
     await _incUserDmCount(uid);
 
     console.log(`[Queue] 📨 DM delivered → user ${uid}, recipient ${recipientId}`);
   } catch (err) {
     const errMsg = err.response?.data?.error?.message || err.message;
     console.error(`[Queue] ❌ DM failed → user ${uid}, recipient ${recipientId}: ${errMsg}`);
-    await _updateStats(auto, false);
+    await _updateStats(job.autoId, false);
   }
 }
 
@@ -158,7 +195,7 @@ function startProcessor() {
       if (!queue.length) continue;
 
       const job   = queue.shift();
-      const delay = (job.auto?.settings?.dmDelay ?? 0) * 1000; // seconds → ms
+      const delay = (job.dmDelay ?? 0) * 1000; // seconds → ms (set on job at enqueue if needed)
 
       if (delay > 0) {
         // Fire after delay but don't block the loop
@@ -174,11 +211,27 @@ function startProcessor() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  INTERNAL: send DM via Instagram Graph API
+//  FIX #10: Resolve {{name}} from recipient's IG profile instead of erasing it.
 // ─────────────────────────────────────────────────────────────────────────────
 async function _sendDm(token, igUserId, recipientId, text, auto) {
+  // FIX #10: Attempt to resolve {{name}} from the IG profile
+  let recipientName = '';
+  if ((text || '').includes('{{name}}') || (text || '').includes('{{username}}')) {
+    try {
+      const profileRes = await axios.get(
+        `https://graph.instagram.com/${recipientId}`,
+        { params: { fields: 'username,name', access_token: token }, timeout: 5000 }
+      );
+      recipientName = profileRes.data.name || profileRes.data.username || '';
+    } catch (_) {
+      // Profile fetch failed — use empty string fallback (keeps existing behaviour)
+      console.warn(`[Queue] Could not fetch profile for ${recipientId} — {{name}} will be blank`);
+    }
+  }
+
   const resolved = (text || '')
-    .replace(/\{\{name\}\}/g, '')
-    .replace(/\{\{username\}\}/g, '')
+    .replace(/\{\{name\}\}/g, recipientName)
+    .replace(/\{\{username\}\}/g, recipientName)
     .replace(/\{\{post\}\}/g, '');
 
   const linkUrl   = auto?.actions?.dm?.linkUrl   || '';
@@ -229,28 +282,35 @@ async function _sendDm(token, igUserId, recipientId, text, auto) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  INTERNAL: update automation stats (dmsSent / failed / dailyLog)
+//  INTERNAL: update automation stats via atomic $inc
+//  FIX #3: No longer mutates a shared in-memory doc — uses findByIdAndUpdate
+//          so concurrent saves cannot overwrite each other.
 // ─────────────────────────────────────────────────────────────────────────────
-async function _updateStats(auto, success) {
-  if (!auto) return;
+async function _updateStats(autoId, success) {
+  if (!autoId) return;
   try {
-    if (!auto.stats) auto.stats = {};
-    if (success) {
-      auto.stats.dmsSent = (auto.stats.dmsSent || 0) + 1;
-    } else {
-      auto.stats.failed  = (auto.stats.failed  || 0) + 1;
-    }
+    const Automation = require('../models/Automation');
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-    const today = new Date().toDateString();
-    auto.stats.dailyLog = auto.stats.dailyLog || [];
-    const entry = auto.stats.dailyLog.find(e => new Date(e.date).toDateString() === today);
-    if (entry) {
-      if (success) entry.dmsSent = (entry.dmsSent || 0) + 1;
+    if (success) {
+      // Atomic increment on dmsSent + today's dailyLog entry
+      const result = await Automation.findOneAndUpdate(
+        { _id: autoId, 'stats.dailyLog.date': today },
+        { $inc: { 'stats.dmsSent': 1, 'stats.dailyLog.$.dmsSent': 1 } }
+      );
+      // If today's dailyLog entry didn't exist yet, push a new one
+      if (!result) {
+        await Automation.findByIdAndUpdate(autoId, {
+          $inc:  { 'stats.dmsSent': 1 },
+          $push: { 'stats.dailyLog': { date: today, dmsSent: 1 } },
+        });
+      }
     } else {
-      auto.stats.dailyLog.push({ date: new Date(), dmsSent: success ? 1 : 0 });
+      await Automation.findByIdAndUpdate(autoId, {
+        $inc: { 'stats.failed': 1 }
+      });
     }
-    auto.markModified('stats');
-    await auto.save();
   } catch (e) {
     console.error('[Queue] Stats update error:', e.message);
   }
