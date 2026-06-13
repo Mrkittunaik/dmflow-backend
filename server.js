@@ -10,6 +10,12 @@ const cookieParser = require('cookie-parser');
 
 const app = express();
 
+// ── Trust Render's proxy (fixes X-Forwarded-For + rate limiting) ───────────
+// Render sits behind a load balancer — without this, express-rate-limit
+// cannot correctly identify real client IPs and throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+// '1' means trust exactly one proxy hop (Render's LB). Never use 'true' in prod.
+app.set('trust proxy', 1);
+
 // ── Security & parsing ─────────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: false }));
 
@@ -51,37 +57,74 @@ app.use((req, res, next) => {
 
 // ── Rate Limiting ───────────────────────────────────────────
 const rateLimit = require('express-rate-limit');
+
+// Key generator: use real IP (works correctly now that trust proxy is set)
+const keyByIp = (req) => req.ip;
+
+// Auth routes — strict: 20 attempts per 15 min, only failed requests count
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
-  skipSuccessfulRequests: true,
-  message: { error: 'Too many attempts, please try again after 15 minutes.' },
+  max: 20,
+  keyGenerator: keyByIp,
+  skipSuccessfulRequests: true,   // successful logins don't count toward limit
+  message: { error: 'Too many login attempts. Please try again after 15 minutes.' },
   standardHeaders: true,
   legacyHeaders: false,
+  handler: (req, res, next, options) => {
+    console.warn(`[RateLimit] Auth blocked: IP ${req.ip} — ${req.path}`);
+    res.status(429).json(options.message);
+  },
 });
+
+// General API — 300 req / 15 min per IP
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
-  message: { error: 'Too many requests, please slow down.' },
+  keyGenerator: keyByIp,
+  message: { error: 'Too many requests. Please slow down.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res, next, options) => {
+    console.warn(`[RateLimit] API blocked: IP ${req.ip} — ${req.path}`);
+    res.status(429).json(options.message);
+  },
+});
+
+// Webhook — very generous (Meta sends bursts), but still capped to prevent abuse
+const webhookLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,   // 1 min window
+  max: 500,                   // Meta can send many events at once
+  keyGenerator: keyByIp,
+  message: { error: 'Webhook rate limit exceeded.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Instagram IG lookup — scraping-heavy route, tighter cap
+const igLookupLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 30,
+  keyGenerator: keyByIp,
+  message: { error: 'Too many Instagram lookups. Please wait a moment.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
 // ── Routes ─────────────────────────────────────────────────
-app.use('/webhook',         require('./routes/webhook'));
-app.use('/auth',            authLimiter, require('./routes/auth'));
-app.use('/api/user',        apiLimiter,  require('./routes/user'));
-app.use('/api/automations', apiLimiter,  require('./routes/automations'));
-app.use('/api/templates',   apiLimiter,  require('./routes/templates'));
-app.use('/api/analytics',   apiLimiter,  require('./routes/analytics'));
-app.use('/api/contacts',    apiLimiter,  require('./routes/contacts'));
-app.use('/api/keywords',    apiLimiter,  require('./routes/keywords'));
-app.use('/api/inbox',       apiLimiter,  require('./routes/inbox'));
-app.use('/api/ig',          apiLimiter,  require('./routes/ig'));
-app.use('/api/billing',     apiLimiter,  require('./routes/billing'));
-app.use('/api/hr',          apiLimiter,  require('./routes/hr'));
-app.use('/api/roles',       apiLimiter,  require('./routes/roles'));
-app.use('/api/joiner',      apiLimiter,  require('./routes/joiner'));
+app.use('/webhook',         webhookLimiter, require('./routes/webhook'));
+app.use('/auth',            authLimiter,    require('./routes/auth'));
+app.use('/api/user',        apiLimiter,     require('./routes/user'));
+app.use('/api/automations', apiLimiter,     require('./routes/automations'));
+app.use('/api/templates',   apiLimiter,     require('./routes/templates'));
+app.use('/api/analytics',   apiLimiter,     require('./routes/analytics'));
+app.use('/api/contacts',    apiLimiter,     require('./routes/contacts'));
+app.use('/api/keywords',    apiLimiter,     require('./routes/keywords'));
+app.use('/api/inbox',       apiLimiter,     require('./routes/inbox'));
+app.use('/api/ig',          igLookupLimiter, require('./routes/ig'));
+app.use('/api/billing',     apiLimiter,     require('./routes/billing'));
+app.use('/api/hr',          authLimiter,    require('./routes/hr'));
+app.use('/api/roles',       apiLimiter,     require('./routes/roles'));
+app.use('/api/joiner',      apiLimiter,     require('./routes/joiner'));
 
 // ── TEMP: Fix wrong Instagram user IDs in DB — remove after running once ────
 app.get('/fix-ig-id', async (req, res) => {
