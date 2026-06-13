@@ -277,6 +277,39 @@ async function handleIncomingDm(user, token, event) {
 
     break; // first matching automation wins per DM
   }
+
+  // ── Flow DM button reply handling ─────────────────────────────────────────
+  // When a user taps a flow button, Instagram sends back the keyword as a DM.
+  // We find the matching button in the flow_dm automation and send its replyDm.
+  const flowAutomations = await Automation.find({
+    userId: user._id,
+    active: true,
+    type:   'flow_dm',
+  }).lean();
+
+  for (const auto of flowAutomations) {
+    const buttons = auto.actions?.flow?.buttons || [];
+    const matchedBtn = buttons.find(b =>
+      b.type === 'reply' && b.keyword && text.toUpperCase().includes(b.keyword.toUpperCase())
+    );
+    if (!matchedBtn?.replyDm) continue;
+
+    const liveAuto = await Automation.findById(auto._id);
+    if (!liveAuto) continue;
+
+    _bumpTriggered(liveAuto, text, senderId, false);
+    await liveAuto.save();
+
+    dmQueue.enqueue(user._id, {
+      token,
+      igUserId:      user.instagram.userId,
+      recipientId:   senderId,
+      text:          matchedBtn.replyDm,
+      autoId:        liveAuto._id.toString(),
+      triggerSource: 'flow_button',
+    });
+    break;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -322,6 +355,7 @@ async function handleComment(user, token, value, isLive = false) {
         'product_link_dm',
         'auto_reply_comment',
         'live_reply',
+        'flow_dm',
       ],
     },
   }).lean(); // FIX #7: use .lean() to get plain objects; reload fresh doc before saving
@@ -506,8 +540,9 @@ function _bumpTriggered(auto, text, fromId, isLive) {
 // FIX #13: _getDmText now correctly reads actions.dm.text (not .message)
 // Falls back to legacy dmText / firstDm fields for old documents.
 function _getDmText(auto) {
-  if (auto.actions?.dm?.text) return auto.actions.dm.text;       // new schema field
-  if (auto.actions?.dm?.message) return auto.actions.dm.message; // legacy alias (if any)
+  if (auto.actions?.dm?.text)            return auto.actions.dm.text;       // new schema field
+  if (auto.actions?.dm?.message)         return auto.actions.dm.message;    // legacy alias (if any)
+  if (auto.actions?.flow?.firstMessage)  return auto.actions.flow.firstMessage; // flow_dm type
   return auto.dmText || auto.firstDm || '';
 }
 
