@@ -18,6 +18,7 @@ const automationSchema = new mongoose.Schema({
       'collect_email',       // new frontend builder type
       'live_reply',          // new frontend builder type
       'product_link_dm',     // new frontend builder type
+      'flow_dm',             // new frontend builder type
     ],
     default: 'keyword_dm',
   },
@@ -61,6 +62,17 @@ const automationSchema = new mongoose.Schema({
       text:     { type: String, default: '' },
       linkTitle:{ type: String, default: '' },
       linkUrl:  { type: String, default: '' },
+    },
+    // Flow DM (interactive buttons)
+    flow: {
+      firstMessage: { type: String, default: '' },
+      buttons: [{
+        label:   { type: String, default: '' },
+        type:    { type: String, default: 'reply' }, // 'reply' | 'link'
+        keyword: { type: String, default: '' },
+        replyDm: { type: String, default: '' },
+        linkUrl: { type: String, default: '' },
+      }],
     },
   },
 
