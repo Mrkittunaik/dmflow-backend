@@ -66,10 +66,36 @@ async function enqueue(userId, job) {
     if (skipDup) {
       const guardKey  = `${uid}::${job.autoId}::${job.recipientId}`;
       const cutoff    = new Date(Date.now() - dupWindow);
-      const existing  = await ProcessedDm.findOne({ key: guardKey, sentAt: { $gte: cutoff } });
-      if (existing) {
+
+      // FIX #6b: Claim the guard atomically at enqueue time, not just after
+      // send. The old code only wrote ProcessedDm AFTER the DM succeeded —
+      // that left a race window: two comments from the same person within
+      // the same ~5s queue tick would both pass findOne() (since neither had
+      // sent yet), and both would get queued, causing two real DMs sent.
+      // We now try to "reclaim" an expired guard atomically; if none exists
+      // we create one, using the unique index to resolve any concurrent race.
+      const reclaimed = await ProcessedDm.findOneAndUpdate(
+        { key: guardKey, sentAt: { $lt: cutoff } },
+        { sentAt: new Date() }
+      );
+      const recentlyClaimed = await ProcessedDm.findOne({ key: guardKey, sentAt: { $gte: cutoff } });
+
+      if (!reclaimed && recentlyClaimed) {
         console.log(`[Queue] 🚫 Duplicate blocked → user ${uid}, recipient ${job.recipientId}`);
         return;
+      }
+      if (!reclaimed && !recentlyClaimed) {
+        // No prior record at all — claim it now before queuing.
+        try {
+          await ProcessedDm.create({ key: guardKey, sentAt: new Date() });
+        } catch (e) {
+          if (e.code === 11000) {
+            // Another concurrent request claimed it a moment earlier — block.
+            console.log(`[Queue] 🚫 Duplicate blocked (race) → user ${uid}, recipient ${job.recipientId}`);
+            return;
+          }
+          throw e;
+        }
       }
     }
   }
@@ -181,6 +207,15 @@ async function processJob(uid, job) {
     const errMsg = err.response?.data?.error?.message || err.message;
     console.error(`[Queue] ❌ DM failed → user ${uid}, recipient ${recipientId}: ${errMsg}`);
     await _updateStats(job.autoId, false);
+
+    // FIX #6b: We claimed the dedup guard optimistically in enqueue(). Since
+    // the DM never actually sent, release the claim so a legitimate retry
+    // (next comment, or manual resend) isn't blocked as a "duplicate" for
+    // the rest of the dedupe window.
+    if (job.autoId) {
+      const guardKey = `${uid}::${job.autoId}::${recipientId}`;
+      await ProcessedDm.deleteOne({ key: guardKey }).catch(() => {});
+    }
   }
 }
 
