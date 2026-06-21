@@ -153,10 +153,18 @@ router.get('/', requireAuth, async (req, res) => {
       Automation.countDocuments(filter),
     ]);
 
-    res.json({
-      automations,
-      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
-    });
+    // FIX #17: Reverted to returning a bare array — the frontend dashboard
+    // (and possibly other pages) call API.getAutomations() expecting a plain
+    // array (automations.map(...), automations.length, etc.). Wrapping the
+    // response in { automations, pagination } broke that contract and caused
+    // "No automations yet" / dashed-out stat cards even when automations
+    // existed and were actively sending DMs. Pagination metadata is still
+    // available, just via response headers instead of changing the body
+    // shape, so nothing that currently works can break.
+    res.set('X-Total-Count', String(total));
+    res.set('X-Page', String(page));
+    res.set('X-Pages', String(Math.ceil(total / limit)));
+    res.json(automations);
   } catch (err) {
     console.error('[Automations] List error:', err.message);
     res.status(500).json({ error: 'Internal server error.' });
