@@ -380,7 +380,12 @@ async function handleComment(user, token, value, isLive = false) {
         recipientId:      commenterId,
         text:             dmText,
         autoId:           liveAuto._id.toString(), // FIX #7: ID not live doc
-        commentId:        replyText ? commentId : null,   // FIX #2
+        // FIX #15: commentId is now always passed for comment-triggered jobs —
+        // not just when a public comment reply is configured. The DM send
+        // itself needs commentId to use Instagram's Private Reply API
+        // (recipient: { comment_id }), which is required for ANY DM sent in
+        // response to a comment, regardless of whether a public reply is also sent.
+        commentId:        commentId,
         commentReplyText: replyText || null,               // FIX #2
         triggerSource:    isLive ? 'live_comment' : 'comment',
       });
