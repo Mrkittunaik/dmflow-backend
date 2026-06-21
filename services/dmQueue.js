@@ -156,7 +156,7 @@ async function processJob(uid, job) {
   }
 
   try {
-    await _sendDm(token, igUserId, recipientId, text, auto);
+    await _sendDm(token, igUserId, recipientId, text, auto, job);
     recordSent(uid);
 
     // FIX #2: Post comment reply AFTER DM is confirmed sent.
@@ -248,7 +248,23 @@ function startProcessor() {
 //  INTERNAL: send DM via Instagram Graph API
 //  FIX #10: Resolve {{name}} from recipient's IG profile instead of erasing it.
 // ─────────────────────────────────────────────────────────────────────────────
-async function _sendDm(token, igUserId, recipientId, text, auto) {
+async function _sendDm(token, igUserId, recipientId, text, auto, job) {
+  // FIX #15: Comment-triggered DMs MUST use Instagram's "Private Reply" API,
+  // which requires recipient: { comment_id }, NOT recipient: { id }.
+  // Using { id: recipientId } for a comment-triggered send is what caused the
+  // "Invalid message id" error — Instagram only allows a normal { id } DM when
+  // the user has actually messaged you directly (a real messaging session).
+  // A comment is not a messaging session, so it must go through the comment_id
+  // path instead. Per Meta docs, Private Replies are also text-only — no
+  // button/template attachments are supported — so we skip the link-card
+  // attempt entirely for these and always send plain text with the link appended.
+  const isCommentTriggered = !!job?.commentId &&
+    (job.triggerSource === 'comment' || job.triggerSource === 'live_comment');
+
+  const recipient = isCommentTriggered
+    ? { comment_id: job.commentId }
+    : { id: recipientId };
+
   // FIX #10: Attempt to resolve {{name}} from the IG profile
   let recipientName = '';
   if ((text || '').includes('{{name}}') || (text || '').includes('{{username}}')) {
@@ -272,13 +288,15 @@ async function _sendDm(token, igUserId, recipientId, text, auto) {
   const linkUrl   = auto?.actions?.dm?.linkUrl   || '';
   const linkTitle = auto?.actions?.dm?.linkTitle  || '';
 
-  // Try link-card (generic template) first
-  if (linkUrl && linkUrl.startsWith('http')) {
+  // Try link-card (generic template) first — but ONLY for normal DM-session
+  // sends. Private Replies (comment-triggered) don't support template
+  // attachments, so we go straight to plain text for those.
+  if (!isCommentTriggered && linkUrl && linkUrl.startsWith('http')) {
     try {
       await axios.post(
         `https://graph.instagram.com/${IG_API_VERSION}/${igUserId}/messages`,
         {
-          recipient: { id: recipientId },
+          recipient,
           message: {
             attachment: {
               type: 'template',
@@ -309,8 +327,8 @@ async function _sendDm(token, igUserId, recipientId, text, auto) {
   await axios.post(
     `https://graph.instagram.com/${IG_API_VERSION}/${igUserId}/messages`,
     {
-      recipient: { id: recipientId },
-      message:   { text: fullText.substring(0, 1000) },
+      recipient,
+      message: { text: fullText.substring(0, 1000) },
     },
     { headers: { Authorization: `Bearer ${token}` } }
   );
