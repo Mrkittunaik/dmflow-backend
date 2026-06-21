@@ -231,15 +231,40 @@ async function handleIncomingDm(user, token, event) {
   );
 
   // ── Keyword / email-collect automations ──────────────────────────────────
+  // FIX #17: A plain incoming DM must ONLY trigger automations that were
+  // explicitly built as DM-keyword automations (trigger.onDmKeyword === true).
+  // Previously this queried by `type` alone, which also matched reel/post
+  // comment automations (e.g. keyword_dm scoped to a specific reel via
+  // media[]/applyAll). Those automations have nothing to do with plain DMs —
+  // handleComment() already fires them correctly when someone comments on
+  // the targeted reel. Without this gate, ANY active automation of these
+  // types fired on EVERY incoming message, regardless of which reel (if
+  // any) it was scoped to, because handleIncomingDm never checked media
+  // targeting and treated an empty/any-match keyword config as "fire on
+  // anything." That's what caused the DM to fire even when the sender never
+  // commented on the reel at all.
+  //
+  // Also: onDmKeyword automations are NOT tied to any post/reel — they are
+  // pure DM-trigger automations by definition, so no _matchesMedia() check
+  // is needed or correct here (a reel-scoped automation should never reach
+  // this branch in the first place now that the trigger gate is in place).
   const dmAutomations = await Automation.find({
     userId: user._id,
     active: true,
+    'trigger.onDmKeyword': true,
     type:   { $in: ['keyword_dm', 'email_collect', 'collect_email', 'discount_code', 'product_link_dm'] },
   }).lean();
 
   for (const auto of dmAutomations) {
     const keywords = auto.trigger?.keywords || (auto.keyword ? [auto.keyword] : []);
-    const anyMatch = auto.trigger?.allComments || auto.trigger?.anyComment || keywords.length === 0;
+    // FIX #17: "any match" must still require explicit opt-in (allComments/
+    // anyComment) for DM triggers — an EMPTY keywords array no longer means
+    // "match anything." For comment automations, empty keywords legitimately
+    // means "any comment on this reel" because the media[] scope already
+    // narrows it down. Plain DMs have no such scope, so empty keywords here
+    // must mean "this automation isn't configured for DM matching yet," not
+    // "match every message anyone sends."
+    const anyMatch = auto.trigger?.allComments || auto.trigger?.anyComment;
     const matched  = anyMatch || keywords.some(kw => text.toUpperCase().includes(kw.toUpperCase()));
     if (!matched) continue;
 
