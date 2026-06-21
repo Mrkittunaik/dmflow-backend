@@ -204,8 +204,15 @@ async function processJob(uid, job) {
 
     console.log(`[Queue] 📨 DM delivered → user ${uid}, recipient ${recipientId}`);
   } catch (err) {
-    const errMsg = err.response?.data?.error?.message || err.message;
+    const igErr = err.response?.data?.error;
+    const errMsg = igErr?.message || err.message;
     console.error(`[Queue] ❌ DM failed → user ${uid}, recipient ${recipientId}: ${errMsg}`);
+    // TEMP DEBUG: full Instagram error details + what we actually sent.
+    // Remove once root cause is confirmed.
+    console.error('[Queue] 🔎 Full IG error object:', JSON.stringify(igErr, null, 2));
+    console.error('[Queue] 🔎 Job payload was:', JSON.stringify({
+      igUserId, recipientId, commentId: job.commentId, triggerSource: job.triggerSource
+    }, null, 2));
     await _updateStats(job.autoId, false);
 
     // FIX #6b: We claimed the dedup guard optimistically in enqueue(). Since
@@ -260,6 +267,9 @@ async function _sendDm(token, igUserId, recipientId, text, auto, job) {
   // attempt entirely for these and always send plain text with the link appended.
   const isCommentTriggered = !!job?.commentId &&
     (job.triggerSource === 'comment' || job.triggerSource === 'live_comment');
+
+  // TEMP DEBUG: confirm which recipient shape is actually used. Remove once confirmed.
+  console.log(`[Queue] 🔎 _sendDm recipient debug — isCommentTriggered: ${isCommentTriggered}, job.commentId: ${job?.commentId}, job.triggerSource: ${job?.triggerSource}, recipientId: ${recipientId}`);
 
   const recipient = isCommentTriggered
     ? { comment_id: job.commentId }
