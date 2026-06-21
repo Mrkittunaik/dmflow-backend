@@ -206,13 +206,8 @@ async function processJob(uid, job) {
   } catch (err) {
     const igErr = err.response?.data?.error;
     const errMsg = igErr?.message || err.message;
-    console.error(`[Queue] ❌ DM failed → user ${uid}, recipient ${recipientId}: ${errMsg}`);
-    // TEMP DEBUG: full Instagram error details + what we actually sent.
-    // Remove once root cause is confirmed.
-    console.error('[Queue] 🔎 Full IG error object:', JSON.stringify(igErr, null, 2));
-    console.error('[Queue] 🔎 Job payload was:', JSON.stringify({
-      igUserId, recipientId, commentId: job.commentId, triggerSource: job.triggerSource
-    }, null, 2));
+    console.error(`[Queue] ❌ DM failed → user ${uid}, recipient ${recipientId}: ${errMsg}` +
+      (igErr ? ` (code: ${igErr.code}, subcode: ${igErr.error_subcode})` : ''));
     await _updateStats(job.autoId, false);
 
     // FIX #6b: We claimed the dedup guard optimistically in enqueue(). Since
@@ -258,18 +253,10 @@ function startProcessor() {
 async function _sendDm(token, igUserId, recipientId, text, auto, job) {
   // FIX #15: Comment-triggered DMs MUST use Instagram's "Private Reply" API,
   // which requires recipient: { comment_id }, NOT recipient: { id }.
-  // Using { id: recipientId } for a comment-triggered send is what caused the
-  // "Invalid message id" error — Instagram only allows a normal { id } DM when
-  // the user has actually messaged you directly (a real messaging session).
-  // A comment is not a messaging session, so it must go through the comment_id
-  // path instead. Per Meta docs, Private Replies are also text-only — no
-  // button/template attachments are supported — so we skip the link-card
-  // attempt entirely for these and always send plain text with the link appended.
+  // A comment is not an open messaging session, so the regular { id } shape
+  // gets rejected with "Invalid message id".
   const isCommentTriggered = !!job?.commentId &&
     (job.triggerSource === 'comment' || job.triggerSource === 'live_comment');
-
-  // TEMP DEBUG: confirm which recipient shape is actually used. Remove once confirmed.
-  console.log(`[Queue] 🔎 _sendDm recipient debug — isCommentTriggered: ${isCommentTriggered}, job.commentId: ${job?.commentId}, job.triggerSource: ${job?.triggerSource}, recipientId: ${recipientId}`);
 
   const recipient = isCommentTriggered
     ? { comment_id: job.commentId }
@@ -285,7 +272,6 @@ async function _sendDm(token, igUserId, recipientId, text, auto, job) {
       );
       recipientName = profileRes.data.name || profileRes.data.username || '';
     } catch (_) {
-      // Profile fetch failed — use empty string fallback (keeps existing behaviour)
       console.warn(`[Queue] Could not fetch profile for ${recipientId} — {{name}} will be blank`);
     }
   }
@@ -296,12 +282,19 @@ async function _sendDm(token, igUserId, recipientId, text, auto, job) {
     .replace(/\{\{post\}\}/g, '');
 
   const linkUrl   = auto?.actions?.dm?.linkUrl   || '';
-  const linkTitle = auto?.actions?.dm?.linkTitle  || '';
+  const linkTitle = (auto?.actions?.dm?.linkTitle || 'Open Link').substring(0, 20); // Button title has no hard documented cap, but keep it short/clean
 
-  // Try link-card (generic template) first — but ONLY for normal DM-session
-  // sends. Private Replies (comment-triggered) don't support template
-  // attachments, so we go straight to plain text for those.
-  if (!isCommentTriggered && linkUrl && linkUrl.startsWith('http')) {
+  // FIX #18: Use Instagram's Button Template (template_type: 'button'), NOT
+  // the generic card template, and NOT plain text with a raw URL appended.
+  // Per Meta's docs, a button template message contains a `text` prompt and
+  // up to 3 buttons — exactly the clean "message + tappable button" look,
+  // with no auto-generated link-preview card. This IS supported on Private
+  // Replies (comment-triggered DMs) — confirmed via Meta's own docs and
+  // real working examples; the earlier assumption that Private Replies were
+  // text-only was incorrect. Using a button instead of a raw link in the
+  // text is also the recommended pattern to avoid Meta's spam-pattern
+  // detection on repeated identical first messages containing links.
+  if (linkUrl && linkUrl.startsWith('http')) {
     try {
       await axios.post(
         `https://graph.instagram.com/${IG_API_VERSION}/${igUserId}/messages`,
@@ -311,12 +304,9 @@ async function _sendDm(token, igUserId, recipientId, text, auto, job) {
             attachment: {
               type: 'template',
               payload: {
-                template_type: 'generic',
-                elements: [{
-                  title:    linkTitle || 'Check this out',
-                  subtitle: resolved,
-                  buttons:  [{ type: 'web_url', url: linkUrl, title: linkTitle || 'Open Link' }],
-                }],
+                template_type: 'button',
+                text:    resolved.substring(0, 640), // Button template text limit
+                buttons: [{ type: 'web_url', url: linkUrl, title: linkTitle }],
               },
             },
           },
@@ -325,13 +315,15 @@ async function _sendDm(token, igUserId, recipientId, text, auto, job) {
       );
       return; // success
     } catch (e) {
-      console.warn('[Queue] Template DM failed, falling back to text+link');
+      console.warn('[Queue] Button template DM failed, falling back to plain text:', e.response?.data?.error?.message || e.message);
+      // Fall through to plain text below — better to deliver SOMETHING than
+      // nothing if the button template is rejected for any reason.
     }
   }
 
-  // Plain text (with link appended if present)
+  // Plain text (with link appended only as a last-resort fallback)
   const fullText = linkUrl
-    ? `${resolved}\n\n${linkTitle ? linkTitle + ': ' : ''}${linkUrl}`
+    ? `${resolved}\n\n${linkTitle}: ${linkUrl}`
     : resolved;
 
   await axios.post(
