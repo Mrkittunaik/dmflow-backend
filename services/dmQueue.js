@@ -145,6 +145,25 @@ async function processJob(uid, job) {
   const Automation = require('../models/Automation');
   const auto = job.autoId ? await Automation.findById(job.autoId) : null;
 
+  // FIX #19: A job sits in the in-memory `queues` Map for up to one 5s tick
+  // (longer if dmDelay is set, or if the hourly cap pushes it back to the
+  // front for a later retry) between when it was enqueued and when it
+  // actually runs. If the user deletes the automation — or just deactivates
+  // it — during that window, the DB record is gone/inactive, but the job
+  // object itself already has everything it needs (text, recipientId,
+  // token) captured at enqueue time, so without this check it would send
+  // the DM anyway: a deleted automation going right on sending messages.
+  // We treat "had an autoId but it no longer resolves to a live, active
+  // automation" as a hard stop — drop the job silently, do not retry it.
+  if (job.autoId && !auto) {
+    console.log(`[Queue] 🗑️ Dropping job — automation ${job.autoId} no longer exists (deleted). Recipient: ${recipientId}`);
+    return;
+  }
+  if (job.autoId && auto && !auto.active) {
+    console.log(`[Queue] ⏸️ Dropping job — automation ${job.autoId} is no longer active. Recipient: ${recipientId}`);
+    return;
+  }
+
   const maxPerHour = auto?.settings?.maxDmsPerHour ?? 100;
 
   if (!canSend(uid, maxPerHour)) {
