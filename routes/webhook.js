@@ -330,18 +330,17 @@ async function handleComment(user, token, value, isLive = false) {
     const isLiveAuto = auto.type === 'live_reply';
 
     // ── Post/media match check ──────────────────────────────────────────────
-    // FIX #5: Empty string mediaId ('') was falsy — now we require applyAll OR
-    // an explicit match. An empty mediaId with applyAll=false does NOT match all.
+    // FIX #16: Now checks the media[] array (multi-post/reel targeting) via
+    // the shared _matchesMedia() helper, not just the old single mediaId
+    // string. This is what fixes "automation set for one post firing on
+    // every comment on the account" — the old code compared against
+    // auto.mediaId only, which the new builder UI's multi-select no longer
+    // reliably populates.
     let appliesToPost;
     if (isLiveAuto && isLive) {
-      appliesToPost = true; // Live automations skip mediaId check
-    } else if (auto.applyAll) {
-      appliesToPost = true;
-    } else if (auto.mediaId && auto.mediaId !== '') {
-      appliesToPost = auto.mediaId === mediaId;
+      appliesToPost = true; // Live automations skip media check
     } else {
-      // No mediaId set and applyAll=false — skip (don't match everything)
-      appliesToPost = false;
+      appliesToPost = _matchesMedia(auto, mediaId);
     }
     if (!appliesToPost) continue;
 
@@ -489,6 +488,24 @@ async function handleStoryReply(user, token, event) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+// FIX #16: Mirrors Automation.prototype.matchesMedia() but works on plain
+// .lean() objects (no Mongoose instance methods available on those). Single
+// source of truth for "does this automation apply to this post/reel?" —
+// covers applyAll, the new media[] array (multi-select), and the legacy
+// single mediaId string for old documents.
+function _matchesMedia(auto, mediaId) {
+  if (auto.applyAll) return true;
+  if (!mediaId) return false;
+
+  if (Array.isArray(auto.media) && auto.media.length > 0) {
+    return auto.media.some(m => m.mediaId === mediaId);
+  }
+  if (auto.mediaId && auto.mediaId !== '') {
+    return auto.mediaId === mediaId;
+  }
+  return false;
+}
 
 // Bump triggered counter + rolling recent log (used in analytics + live builder view)
 function _bumpTriggered(auto, text, fromId, isLive) {
