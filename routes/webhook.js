@@ -19,6 +19,7 @@
 const express    = require('express');
 const router     = express.Router();
 const axios      = require('axios');
+const mongoose   = require('mongoose');
 const User       = require('../models/User');
 const Automation = require('../models/Automation');
 const Contact    = require('../models/Contact');
@@ -28,18 +29,20 @@ const dmQueue    = require('../services/dmQueue');
 const IG_API     = 'https://graph.instagram.com';
 const IG_VERSION = 'v21.0';
 
-// ── In-process comment dedup guard ───────────────────────────────────────────
+// ── DB-backed comment dedup guard ────────────────────────────────────────────
 // Prevents duplicate comment replies when Meta re-delivers the same event.
-// Key: commentId, Value: timestamp of first processing
-// FIX #1 / #9: deduplication for comment events (mirrors DM igMsgId guard)
-const processedComments = new Map();
-// Clean up entries older than 48 hours every hour
-setInterval(() => {
-  const cutoff = Date.now() - 48 * 3600 * 1000;
-  for (const [k, ts] of processedComments.entries()) {
-    if (ts < cutoff) processedComments.delete(k);
-  }
-}, 3600 * 1000);
+// FIX #1 / #9: original in-memory Map guard did not survive server
+// restarts/redeploys (common on Render) or work across multiple instances —
+// a Meta retry landing after a restart would slip through and cause a
+// second reply. Now backed by MongoDB (mirrors dmQueue.js's ProcessedDm
+// pattern) with a TTL index so it survives restarts and is shared across
+// all instances.
+const processedCommentSchema = new mongoose.Schema({
+  key:    { type: String, required: true, unique: true },
+  sentAt: { type: Date, default: Date.now, expires: 48 * 3600 }, // TTL 48h
+});
+const ProcessedComment = mongoose.models.ProcessedComment ||
+  mongoose.model('ProcessedComment', processedCommentSchema);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /webhook — Meta verification handshake
@@ -320,13 +323,19 @@ async function handleComment(user, token, value, isLive = false) {
 
   if (!commenterId || !commentText || !commentId) return;
 
-  // FIX #1 / #9: Deduplicate comment events — Meta re-delivers the same event
+  // FIX #1 / #9: Deduplicate comment events — Meta re-delivers the same event.
+  // Atomic claim via unique index: if two requests race (e.g. Meta's retry
+  // landing concurrently with the original), only one insert succeeds.
   const commentDedupeKey = `${user._id}::${commentId}`;
-  if (processedComments.has(commentDedupeKey)) {
-    console.log(`[Webhook] 🚫 Duplicate comment event blocked: ${commentId}`);
-    return;
+  try {
+    await ProcessedComment.create({ key: commentDedupeKey });
+  } catch (e) {
+    if (e.code === 11000) {
+      console.log(`[Webhook] 🚫 Duplicate comment event blocked: ${commentId}`);
+      return;
+    }
+    throw e;
   }
-  processedComments.set(commentDedupeKey, Date.now());
 
   // Never react to your own comments
   if (commenterId === user.instagram.userId) {
