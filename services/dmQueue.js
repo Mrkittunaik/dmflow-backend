@@ -55,47 +55,40 @@ const hourlyTracker = new Map();
 async function enqueue(userId, job) {
   const uid = userId.toString();
 
-  // ── Duplicate guard (FIX #6: DB-backed) ──────────────────────────────────
+  // ── Duplicate guard ───────────────────────────────────────────────────────
+  // Per user request: always resend DM+reply, even if the same person
+  // commented before (no 24h "already messaged them" blocking anymore).
+  //
+  // We still guard against the narrow race where the SAME comment event
+  // gets enqueued twice within the same instant (e.g. Meta redelivering a
+  // webhook a few ms apart before either job has been processed) — that's
+  // not "they commented again," it's the same event landing twice, and
+  // sending two DMs for one comment would still look broken to the user.
+  // Window is intentionally tiny (10s) so real repeat comments — even
+  // seconds apart — always go through.
   if (job.autoId) {
-    // Load settings from DB to check skipDuplicate / duplicateWindowHours
-    const Automation = require('../models/Automation');
-    const autoSettings = await Automation.findById(job.autoId, 'settings').lean();
-    const skipDup   = autoSettings?.settings?.skipDuplicate !== false; // default true
-    const dupWindow = (autoSettings?.settings?.duplicateWindowHours ?? 24) * 3600 * 1000;
+    const guardKey = `${uid}::${job.autoId}::${job.recipientId}::${job.commentId || 'nocomment'}`;
+    const cutoff   = new Date(Date.now() - 10 * 1000);
 
-    if (skipDup) {
-      const guardKey  = `${uid}::${job.autoId}::${job.recipientId}`;
-      const cutoff    = new Date(Date.now() - dupWindow);
+    const reclaimed = await ProcessedDm.findOneAndUpdate(
+      { key: guardKey, sentAt: { $lt: cutoff } },
+      { sentAt: new Date() }
+    );
+    const recentlyClaimed = await ProcessedDm.findOne({ key: guardKey, sentAt: { $gte: cutoff } });
 
-      // FIX #6b: Claim the guard atomically at enqueue time, not just after
-      // send. The old code only wrote ProcessedDm AFTER the DM succeeded —
-      // that left a race window: two comments from the same person within
-      // the same ~5s queue tick would both pass findOne() (since neither had
-      // sent yet), and both would get queued, causing two real DMs sent.
-      // We now try to "reclaim" an expired guard atomically; if none exists
-      // we create one, using the unique index to resolve any concurrent race.
-      const reclaimed = await ProcessedDm.findOneAndUpdate(
-        { key: guardKey, sentAt: { $lt: cutoff } },
-        { sentAt: new Date() }
-      );
-      const recentlyClaimed = await ProcessedDm.findOne({ key: guardKey, sentAt: { $gte: cutoff } });
-
-      if (!reclaimed && recentlyClaimed) {
-        console.log(`[Queue] 🚫 Duplicate blocked → user ${uid}, recipient ${job.recipientId}`);
-        return;
-      }
-      if (!reclaimed && !recentlyClaimed) {
-        // No prior record at all — claim it now before queuing.
-        try {
-          await ProcessedDm.create({ key: guardKey, sentAt: new Date() });
-        } catch (e) {
-          if (e.code === 11000) {
-            // Another concurrent request claimed it a moment earlier — block.
-            console.log(`[Queue] 🚫 Duplicate blocked (race) → user ${uid}, recipient ${job.recipientId}`);
-            return;
-          }
-          throw e;
+    if (!reclaimed && recentlyClaimed) {
+      console.log(`[Queue] 🚫 Same event re-fired within 10s, blocked → user ${uid}, recipient ${job.recipientId}`);
+      return;
+    }
+    if (!reclaimed && !recentlyClaimed) {
+      try {
+        await ProcessedDm.create({ key: guardKey, sentAt: new Date() });
+      } catch (e) {
+        if (e.code === 11000) {
+          console.log(`[Queue] 🚫 Same event re-fired (race), blocked → user ${uid}, recipient ${job.recipientId}`);
+          return;
         }
+        throw e;
       }
     }
   }
@@ -207,16 +200,6 @@ async function processJob(uid, job) {
       }
     }
 
-    // FIX #6: Persist duplicate guard to DB so it survives restarts
-    if (job.autoId) {
-      const guardKey = `${uid}::${job.autoId}::${recipientId}`;
-      await ProcessedDm.findOneAndUpdate(
-        { key: guardKey },
-        { sentAt: new Date() },
-        { upsert: true }
-      );
-    }
-
     // FIX #3: Update dmsSent via atomic $inc — no shared-doc race condition
     await _updateStats(job.autoId, true);
     await _incUserDmCount(uid);
@@ -229,12 +212,10 @@ async function processJob(uid, job) {
       (igErr ? ` (code: ${igErr.code}, subcode: ${igErr.error_subcode})` : ''));
     await _updateStats(job.autoId, false);
 
-    // FIX #6b: We claimed the dedup guard optimistically in enqueue(). Since
-    // the DM never actually sent, release the claim so a legitimate retry
-    // (next comment, or manual resend) isn't blocked as a "duplicate" for
-    // the rest of the dedupe window.
+    // Release the short-window race guard claimed in enqueue() so a
+    // legitimate retry isn't blocked by the 10s same-event window.
     if (job.autoId) {
-      const guardKey = `${uid}::${job.autoId}::${recipientId}`;
+      const guardKey = `${uid}::${job.autoId}::${recipientId}::${job.commentId || 'nocomment'}`;
       await ProcessedDm.deleteOne({ key: guardKey }).catch(() => {});
     }
   }
