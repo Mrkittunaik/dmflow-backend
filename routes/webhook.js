@@ -316,10 +316,11 @@ async function handleIncomingDm(user, token, event) {
 // FIX #1/#9: commentId deduplication guard prevents double-fire on Meta retry.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleComment(user, token, value, isLive = false) {
-  const commentId   = value.id;
-  const commentText = (value.text || '').trim();
-  const commenterId = value.from?.id;
-  const mediaId     = value.media?.id || value.media_id || '';
+  const commentId    = value.id;
+  const commentText  = (value.text || '').trim();
+  const commenterId  = value.from?.id;
+  const commenterName = (value.from?.username || '').toLowerCase();
+  const mediaId      = value.media?.id || value.media_id || '';
 
   if (!commenterId || !commentText || !commentId) return;
 
@@ -337,8 +338,17 @@ async function handleComment(user, token, value, isLive = false) {
     throw e;
   }
 
-  // Never react to your own comments
-  if (commenterId === user.instagram.userId) {
+  // Never react to your own comments (including your own auto-posted
+  // comment reply, which otherwise re-triggers this same automation in
+  // a loop). Matching on ID alone isn't reliable here — Instagram's
+  // comment webhook `from.id` can be a different scoped ID than the
+  // `id` returned by the /me profile call used at connect time. Username
+  // is stable and always present, so check both.
+  const ownUsername = (user.instagram.username || '').toLowerCase();
+  if (
+    (commenterId && commenterId === user.instagram.userId) ||
+    (commenterName && ownUsername && commenterName === ownUsername)
+  ) {
     console.log(`[Webhook] Skipping self-comment by owner on media ${mediaId}`);
     return;
   }
