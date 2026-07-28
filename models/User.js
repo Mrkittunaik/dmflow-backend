@@ -74,6 +74,11 @@ userSchema.pre('save', function(next) {
   }
   next();
 });
+// Prevent the same Instagram account from being linked to more than one user at once.
+userSchema.index(
+  { 'instagram.userId': 1 },
+  { unique: true, partialFilterExpression: { 'instagram.connected': true } }
+);
 userSchema.methods.resetMonthlyDms = function() {
   this.dmsSentMonth = 0;
   return this.save();
