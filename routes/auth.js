@@ -543,6 +543,25 @@ router.get('/instagram/callback', async (req, res) => {
     const user = await User.findById(userId);
     if (!user) return res.redirect(`${REDIRECT_BASE}?error=user_not_found`);
 
+    // ── Step 3.5: Block if this Instagram account is already linked to a DIFFERENT user ──
+    const existingOwner = await User.findOne({
+      'instagram.userId': igUserId,
+      'instagram.connected': true,
+      _id: { $ne: userId },
+    });
+    if (existingOwner) {
+      const maskEmail = (email) => {
+        const [name, domain] = String(email).split('@');
+        if (!domain) return 'another account';
+        const visible = name.slice(0, 3);
+        return visible + 'x'.repeat(Math.max(name.length - 3, 3)) + '@' + domain;
+      };
+      const CONNECT_PAGE = `${process.env.FRONTEND_URL}/pages/onboarding/connect.html`;
+      return res.redirect(
+        `${CONNECT_PAGE}?error=instagram_already_linked&linkedEmail=${encodeURIComponent(maskEmail(existingOwner.email))}`
+      );
+    }
+
     user.instagram.connected     = true;
     user.instagram.accessToken   = longLivedToken;  // encrypted by pre-save hook
     user.instagram.userId        = igUserId;
